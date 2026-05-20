@@ -387,6 +387,33 @@ def test_library_public_api(backend):
     assert len(lib) == 0
 
 
+def test_library_public_introspection_api(backend):
+    lib = nm.NumetaLibrary(f"public_introspection_{backend}")
+
+    @nm.jit(backend=backend, library=lib)
+    def fill(scale: nm.comptime, out):
+        out[:] = scale
+
+    array_type = nm.float64[3]
+    fill(1, array_type)
+    fill(2, array_type)
+
+    first_signature = lib.signature_for_call("fill", 1, array_type)
+    second_signature = lib.signature_for_call("fill", 2, array_type)
+
+    assert lib.signatures("fill") == [first_signature, second_signature]
+
+    symbols = lib.compiled_symbols("fill")
+    assert set(symbols) == {first_signature, second_signature}
+    assert all(isinstance(symbol, str) for symbol in symbols.values())
+
+    compiled = lib.compiled_function("fill", first_signature)
+    assert compiled.func_name == symbols[first_signature]
+
+    with pytest.raises(KeyError, match="no compiled specialization"):
+        lib.compiled_function("fill", (("missing", np.float64),))
+
+
 def _make_selected_replace_case(name, backend):
     lib = nm.NumetaLibrary(f"{name}_{backend}")
 

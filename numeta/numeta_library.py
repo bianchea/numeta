@@ -167,6 +167,10 @@ class NumetaLibrary:
         "remove",
         "replace",
         "list_functions",
+        "signatures",
+        "compiled_symbols",
+        "signature_for_call",
+        "compiled_function",
         "save",
         "load",
         "print_f90_files",
@@ -384,6 +388,28 @@ class NumetaLibrary:
 
     def list_functions(self) -> list[str]:
         return list(self._entries)
+
+    def signatures(self, name: str) -> list:
+        return list(self._entries[name]._compiled_functions)
+
+    def compiled_symbols(self, name: str) -> dict:
+        return {
+            signature: compiled.func_name
+            for signature, compiled in self._entries[name]._compiled_functions.items()
+        }
+
+    def signature_for_call(self, name: str, *args, **kwargs):
+        return self._entries[name].get_signature(*args, **kwargs)
+
+    def compiled_function(self, name: str, signature) -> NumetaCompiledFunction:
+        try:
+            return self._entries[name]._compiled_functions[signature]
+        except KeyError as exc:
+            if name not in self._entries:
+                raise
+            raise KeyError(
+                f"Function {name!r} has no compiled specialization for signature {signature!r}"
+            ) from exc
 
     @property
     def functions(self) -> MappingProxyType:

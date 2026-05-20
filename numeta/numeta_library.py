@@ -225,7 +225,16 @@ class NumetaLibrary:
         *,
         compile_now: bool = True,
         require_existing_specializations: bool = True,
+        signatures: Iterable | None = None,
+        non_selected: str = "preserve",
     ) -> NumetaFunction:
+        valid_non_selected = {"preserve", "invalidate", "error"}
+        if non_selected not in valid_non_selected:
+            raise ValueError(
+                "non_selected must be one of "
+                f"{', '.join(sorted(repr(policy) for policy in valid_non_selected))}"
+            )
+
         if function is None:
             if not isinstance(name_or_function, NumetaFunction):
                 raise TypeError("replace(function) expects a NumetaFunction")
@@ -265,6 +274,36 @@ class NumetaLibrary:
 
         _validate_function_level_compatibility(old_func, new_func)
 
+        old_signatures = tuple(old_func._compiled_functions)
+        if signatures is None:
+            selected_signatures = old_signatures
+            preserve_unselected = False
+        else:
+            selected_signatures = tuple(dict.fromkeys(signatures))
+            if not selected_signatures:
+                raise ValueError("signatures must contain at least one specialization")
+
+            missing_signatures = [
+                signature
+                for signature in selected_signatures
+                if signature not in old_func._compiled_functions
+            ]
+            if missing_signatures:
+                raise KeyError(
+                    f"Cannot replace unknown specialization(s) for {name!r}: "
+                    f"{missing_signatures!r}"
+                )
+
+            unselected_signatures = [
+                signature for signature in old_signatures if signature not in selected_signatures
+            ]
+            if non_selected == "error" and unselected_signatures:
+                raise ValueError(
+                    f"replace(..., non_selected='error') received {len(unselected_signatures)} "
+                    f"unselected specialization(s) for {name!r}"
+                )
+            preserve_unselected = non_selected == "preserve"
+
         original_state = {
             "name": new_func.name,
             "return_signatures": new_func.return_signatures.copy(),
@@ -277,7 +316,8 @@ class NumetaLibrary:
         names_added_by_replace = []
 
         try:
-            for signature, old_compiled in old_func._compiled_functions.items():
+            for signature in selected_signatures:
+                old_compiled = old_func._compiled_functions[signature]
                 old_symbol = old_compiled.func_name
                 if not native_name_registry.is_reserved(old_symbol):
                     names_added_by_replace.append(old_symbol)
@@ -296,6 +336,26 @@ class NumetaLibrary:
                 if compile_now:
                     new_func._compiled_functions[signature].compile_obj()
 
+            if preserve_unselected:
+                for signature in old_signatures:
+                    if signature in selected_signatures:
+                        continue
+                    new_func._compiled_functions[signature] = old_func._compiled_functions[
+                        signature
+                    ]
+                    if signature in old_func.return_signatures:
+                        new_func.return_signatures[signature] = old_func.return_signatures[
+                            signature
+                        ]
+                    if signature in old_func._wrapper_specs:
+                        new_func._wrapper_specs[signature] = old_func._wrapper_specs[signature]
+                    else:
+                        new_func._wrapper_specs[signature] = old_func.build_wrapper_spec(signature)
+                    if signature in old_func._pyc_extensions:
+                        new_func._pyc_extensions[signature] = old_func._pyc_extensions[signature]
+                    if signature in old_func._fast_call:
+                        new_func._fast_call[signature] = old_func._fast_call[signature]
+
         except Exception:
             new_func.name = original_state["name"]
             new_func.return_signatures = original_state["return_signatures"]
@@ -308,7 +368,8 @@ class NumetaLibrary:
 
         new_func.name = name
         new_func._library_pyc_extension = None
-        new_func._fast_call.clear()
+        if not preserve_unselected:
+            new_func._fast_call.clear()
         self._entries[name] = new_func
 
         if self.name in NumetaLibrary.loaded:

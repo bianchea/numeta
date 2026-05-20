@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 import pickle
 from functools import partial
+from types import MethodType
 
 import pytest
 import numeta as nm
@@ -384,6 +385,107 @@ def test_library_public_api(backend):
     lib.remove("add")
     assert "add" not in lib
     assert len(lib) == 0
+
+
+def _make_selected_replace_case(name, backend):
+    lib = nm.NumetaLibrary(f"{name}_{backend}")
+
+    @nm.jit(backend=backend, library=lib)
+    def fill(scale: nm.comptime, out):
+        out[:] = scale
+
+    array_type = nm.float64[3]
+    fill(1, array_type)
+    fill(2, array_type)
+
+    old_func = lib["fill"]
+    first_signature = fill.get_signature(1, array_type)
+    second_signature = fill.get_signature(2, array_type)
+    old_symbols = {
+        signature: compiled.func_name
+        for signature, compiled in old_func._compiled_functions.items()
+    }
+
+    @nm.jit(backend=backend)
+    def replacement(scale: nm.comptime, out):
+        out[:] = scale + 10
+
+    return lib, old_func, replacement, first_signature, second_signature, old_symbols
+
+
+def test_library_replace_selected_signature_preserves_unselected(backend):
+    lib, old_func, replacement, first_signature, second_signature, old_symbols = (
+        _make_selected_replace_case("replace_selected_preserve", backend)
+    )
+
+    construct_calls = []
+    original_construct = replacement.construct_compiled_target
+
+    def counted_construct(self, signature, *args, **kwargs):
+        construct_calls.append((signature, kwargs.get("forced_name")))
+        return original_construct(signature, *args, **kwargs)
+
+    replacement.construct_compiled_target = MethodType(counted_construct, replacement)
+
+    replaced = lib.replace(
+        "fill",
+        replacement,
+        signatures=[first_signature],
+        compile_now=False,
+    )
+
+    assert replaced is replacement
+    assert construct_calls == [(first_signature, old_symbols[first_signature])]
+    assert set(replaced._compiled_functions) == {first_signature, second_signature}
+    assert replaced._compiled_functions[first_signature].func_name == old_symbols[first_signature]
+    assert (
+        replaced._compiled_functions[first_signature]
+        is not old_func._compiled_functions[first_signature]
+    )
+    assert (
+        replaced._compiled_functions[second_signature]
+        is old_func._compiled_functions[second_signature]
+    )
+
+
+def test_library_replace_selected_signature_can_invalidate_unselected(backend):
+    lib, _old_func, replacement, first_signature, second_signature, old_symbols = (
+        _make_selected_replace_case("replace_selected_invalidate", backend)
+    )
+
+    replaced = lib.replace(
+        "fill",
+        replacement,
+        signatures=[first_signature],
+        compile_now=False,
+        non_selected="invalidate",
+    )
+
+    assert set(replaced._compiled_functions) == {first_signature}
+    assert second_signature not in replaced._compiled_functions
+
+    lib.fill(2, nm.float64[3])
+
+    assert second_signature in replaced._compiled_functions
+    assert replaced._compiled_functions[second_signature].func_name != old_symbols[second_signature]
+
+
+def test_library_replace_selected_signature_error_policy_rejects_subset(backend):
+    lib, old_func, replacement, first_signature, _second_signature, _old_symbols = (
+        _make_selected_replace_case("replace_selected_error", backend)
+    )
+
+    with pytest.raises(ValueError, match="non_selected='error'"):
+        lib.replace(
+            "fill",
+            replacement,
+            signatures=[first_signature],
+            compile_now=False,
+            non_selected="error",
+        )
+
+    assert lib["fill"] is old_func
+    assert replacement._compiled_functions == {}
 
 
 def test_library_register_rejects_reserved_name(backend):

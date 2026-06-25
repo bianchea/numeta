@@ -30,6 +30,8 @@ def jit(
     library: NumetaLibrary | None = None,
     reattach: bool = False,
     backend: str | None = None,
+    simd_arch: str | None = None,
+    simd_features: Iterable[str] | str | None = None,
 ):
     """@jit(...) used with arguments."""
     ...
@@ -46,6 +48,8 @@ def jit(
     library: NumetaLibrary | None = None,
     reattach: bool = False,
     backend: str | None = None,
+    simd_arch: str | None = None,
+    simd_features: Iterable[str] | str | None = None,
 ):
     """
     Compile a function with the Numeta JIT, either directly or via parameters.
@@ -89,6 +93,13 @@ def jit(
         do_checks = settings.default_do_checks
     if compile_flags is None:
         compile_flags = settings.default_compile_flags
+    if simd_arch is None:
+        simd_arch = settings.default_simd_arch
+    if simd_features is None:
+        simd_features = settings.default_simd_features
+    elif isinstance(simd_features, str):
+        simd_features = (simd_features,)
+    simd_features_tuple = tuple(str(feature).lower() for feature in simd_features)
     compile_flags = settings._normalize_compile_flags(compile_flags)
     compile_flags_list = list(compile_flags)
     if func is None:
@@ -119,6 +130,11 @@ def jit(
                         f"function {name} has been loaded with different compile_flags value: {nm_func.compile_flags}",
                         stacklevel=2,
                     )
+                if getattr(nm_func, "simd_arch", settings.default_simd_arch) != simd_arch:
+                    warnings.warn(
+                        f"function {name} has been loaded with different simd_arch value: {getattr(nm_func, 'simd_arch', settings.default_simd_arch)}",
+                        stacklevel=2,
+                    )
             else:
                 nm_func = NumetaFunction(
                     f,
@@ -128,6 +144,8 @@ def jit(
                     namer=namer,
                     inline=inline,
                     backend=backend,
+                    simd_arch=simd_arch,
+                    simd_features=simd_features_tuple,
                 )
                 if library is not None:
                     library.register(nm_func)
@@ -143,5 +161,7 @@ def jit(
             namer=namer,
             inline=inline,
             backend=backend,
+            simd_arch=simd_arch,
+            simd_features=simd_features_tuple,
         )
         return nm_func

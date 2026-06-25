@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, NoReturn, cast
 
 import numpy as np
@@ -12,8 +13,14 @@ from numeta.exceptions import raise_with_source
 from numeta.settings import settings as nm_settings
 from numeta.ast.namespace import Namespace
 from numeta.ast.variable import Variable
+from numeta.type_rules import is_vector_dtype
 
 from numeta.c.c_syntax import render_expr_blocks
+from numeta.c.simd import helper_name as simd_helper_name
+from numeta.c.simd import needs_header as simd_needs_header
+from numeta.c.simd import render_helpers as render_simd_helpers
+from numeta.c.simd import render_typedefs as render_simd_typedefs
+from numeta.simd.target import make_simd_target
 
 from numeta.ir.nodes import (
     IRAllocate,
@@ -32,6 +39,7 @@ from numeta.ir.nodes import (
     IRPrint,
     IRProcedure,
     IRReturn,
+    IRSimdStore,
     IRSlice,
     IRUnary,
     IRVar,
@@ -59,15 +67,93 @@ _C_BINARY_OPS = {
 }
 
 
+@dataclass
+class CSymbolInfo:
+    name: str
+    ctype: str | None = None
+    is_array: bool = False
+    rank: int = 0
+    dims_exprs: list[str] | None = None
+    fortran_order: bool = False
+    is_pointer: bool = False
+    pass_by_value: bool = False
+    shape_base: str | None = None
+
+    @property
+    def is_shape_descriptor(self) -> bool:
+        return self.shape_base is not None
+
+    @property
+    def is_scalar_pointer(self) -> bool:
+        return self.is_pointer and not self.is_array
+
+    @property
+    def is_array_pointer(self) -> bool:
+        return self.is_pointer and self.is_array
+
+
+@dataclass(frozen=True)
+class CParamInfo:
+    name: str
+    kind: str
+    shape_base: str | None = None
+
+
+@dataclass(frozen=True)
+class CProcedureSignature:
+    name: str
+    params: tuple[CParamInfo, ...]
+
+    def expects_shape_descriptor_before_call_arg(self, args: list[IRExpr], arg_idx: int) -> bool:
+        param_idx = 0
+        actual_idx = 0
+        while param_idx < len(self.params) and actual_idx < arg_idx:
+            param = self.params[param_idx]
+            actual = args[actual_idx]
+            if param.kind == "shape_descriptor":
+                if _is_shape_descriptor_expr(actual, param.shape_base):
+                    actual_idx += 1
+                param_idx += 1
+                continue
+            actual_idx += 1
+            param_idx += 1
+
+        if param_idx >= len(self.params):
+            return False
+        param = self.params[param_idx]
+        if param.kind != "shape_descriptor":
+            return False
+        if arg_idx > 0 and _is_shape_descriptor_expr(args[arg_idx - 1], param.shape_base):
+            return False
+        return True
+
+
+def _is_shape_descriptor_expr(expr: IRExpr, base: str | None = None) -> bool:
+    if isinstance(expr, IRIntrinsic) and expr.name == "array_constructor":
+        return True
+    if isinstance(expr, IRVarRef) and expr.var is not None:
+        name = expr.var.name
+        if not name.startswith("shape_"):
+            return False
+        return base is None or name == f"shape_{base}"
+    return False
+
+
 class CEmitter:
-    def __init__(self) -> None:
+    def __init__(self, *, simd_arch: str | None = None, simd_features=()) -> None:
         self._array_info: dict[str, dict[str, Any]] = {}
-        self._pointer_args: dict[str, bool] = {}
         self._shape_arg_map: dict[str, str] = {}
+        self._symbols: dict[str, CSymbolInfo] = {}
         self._tmp_counter = 0
-        self._pointer_locals: set[str] = set()
         self._requires_math = False
         self._reduction_helpers: dict[tuple[str, str], str] = {}
+        if simd_arch is None:
+            simd_arch = nm_settings.default_simd_arch
+        if simd_features is None:
+            simd_features = nm_settings.default_simd_features
+        self._simd_target = make_simd_target(simd_arch, features=simd_features)
+        self._vector_types: set[type[DataType]] = set()
+        self._simd_helpers_needed: set[tuple[str, type[DataType]]] = set()
 
     @property
     def requires_math(self) -> bool:
@@ -104,20 +190,40 @@ class CEmitter:
 
     def emit_procedure(self, proc: IRProcedure) -> tuple[str, bool]:
         self._array_info = {}
-        self._pointer_args = {}
         self._shape_arg_map = {}
+        self._symbols = {}
         self._tmp_counter = 0
-        self._pointer_locals = set()
         self._requires_math = False
         self._reduction_helpers = {}
+        self._vector_types = set()
+        self._simd_helpers_needed = set()
 
         for arg in proc.args:
             if arg.name.startswith("shape_"):
                 base = arg.name[len("shape_") :]
                 if base:
                     self._shape_arg_map[arg.name] = base
+                    self._symbols[arg.name] = CSymbolInfo(name=arg.name, shape_base=base)
 
         arg_specs = self._build_signature(proc)
+        self._collect_simd_requirements(proc)
+
+        struct_defs = self._collect_struct_defs(proc)
+        global_constants = self._collect_global_constants(proc)
+        prototypes = self._render_prototypes(proc)
+
+        body_lines = []
+        body_lines.extend(self._render_local_declarations(proc, indent=1))
+        body_lines.extend(self._render_statements(proc.body, indent=1))
+
+        reduction_helpers = self._collect_reduction_helpers()
+        simd_typedefs = render_simd_typedefs(self._vector_types, self._simd_target)
+        simd_helpers = render_simd_helpers(
+            self._vector_types,
+            self._simd_helpers_needed,
+            self._simd_target,
+        )
+
         lines: list[str] = []
         lines.append("#include <Python.h>\n")
         lines.append("#include <numpy/arrayobject.h>\n")
@@ -126,37 +232,35 @@ class CEmitter:
         lines.append("#include <stdio.h>\n")
         lines.append("#include <stdlib.h>\n")
         lines.append("#include <omp.h>\n")
+        simd_header = simd_needs_header(self._vector_types, self._simd_target)
+        if simd_header is not None:
+            lines.append(f"#include <{simd_header}>\n")
         if self._requires_math:
             lines.append("#include <math.h>\n")
         lines.append("\n")
 
-        struct_defs = self._collect_struct_defs(proc)
         if struct_defs:
             lines.extend(struct_defs)
             lines.append("\n")
 
-        reduction_helpers = self._collect_reduction_helpers()
+        if simd_typedefs:
+            lines.extend(simd_typedefs)
+            lines.append("\n")
+
+        if simd_helpers:
+            lines.extend(simd_helpers)
+            lines.append("\n")
+
         if reduction_helpers:
             lines.extend(reduction_helpers)
             lines.append("\n")
 
-        global_constants = self._collect_global_constants(proc)
         if global_constants:
             lines.extend(global_constants)
             lines.append("\n")
 
-        prototypes = self._render_prototypes(proc)
         if prototypes:
             lines.extend(prototypes)
-            lines.append("\n")
-
-        body_lines = []
-        body_lines.extend(self._render_local_declarations(proc, indent=1))
-        body_lines.extend(self._render_statements(proc.body, indent=1))
-
-        reduction_helpers = self._collect_reduction_helpers()
-        if reduction_helpers:
-            lines.extend(reduction_helpers)
             lines.append("\n")
 
         args = ", ".join(arg_specs)
@@ -185,14 +289,157 @@ class CEmitter:
 
         return list(defs.values())
 
+    def _dtype_from_expr(self, expr: IRExpr | None) -> DataType | None:
+        if expr is None:
+            return None
+        source = getattr(expr, "source", None)
+        dtype = getattr(source, "dtype", None)
+        if dtype is not None:
+            return dtype
+        if isinstance(expr, IRVarRef) and expr.var is not None:
+            return self._dtype_from_irvar(expr.var)
+        return None
+
+    def _is_vector_expr(self, expr: IRExpr | None) -> bool:
+        return is_vector_dtype(self._dtype_from_expr(expr))
+
+    def _register_vector_type(self, dtype) -> None:
+        if dtype is not None and is_vector_dtype(dtype):
+            self._vector_types.add(dtype)
+
+    def _register_simd_helper(self, op: str, vector_dtype) -> None:
+        self._register_vector_type(vector_dtype)
+        self._simd_helpers_needed.add((op, vector_dtype))
+
+    def _collect_simd_requirements(self, proc: IRProcedure) -> None:
+        for var in list(proc.args) + list(proc.locals):
+            self._register_vector_type(self._dtype_from_irvar(var))
+
+        def visit_expr(expr: IRExpr | None):
+            if expr is None:
+                return
+            dtype = self._dtype_from_expr(expr)
+            self._register_vector_type(dtype)
+
+            if isinstance(expr, IRBinary):
+                visit_expr(expr.left)
+                visit_expr(expr.right)
+                if is_vector_dtype(dtype):
+                    if expr.op not in {"add", "sub", "mul", "div"}:
+                        self._raise_with_source(
+                            NotImplementedError,
+                            f"Vector operation {expr.op!r} is not supported by the C backend",
+                            origin=expr,
+                        )
+                    self._register_simd_helper(expr.op, dtype)
+                    if not self._is_vector_expr(expr.left):
+                        self._register_simd_helper("broadcast", dtype)
+                    if not self._is_vector_expr(expr.right):
+                        self._register_simd_helper("broadcast", dtype)
+                return
+            if isinstance(expr, IRUnary):
+                visit_expr(expr.operand)
+                return
+            if isinstance(expr, IRCallExpr):
+                visit_expr(expr.callee)
+                for arg in expr.args:
+                    visit_expr(arg)
+                return
+            if isinstance(expr, IRGetItem):
+                visit_expr(expr.base)
+                for idx in expr.indices:
+                    if isinstance(idx, IRSlice):
+                        visit_expr(idx.start)
+                        visit_expr(idx.stop)
+                        visit_expr(idx.step)
+                    else:
+                        visit_expr(cast(IRExpr, idx))
+                return
+            if isinstance(expr, IRGetAttr):
+                visit_expr(expr.base)
+                return
+            if isinstance(expr, IRIntrinsic):
+                for arg in expr.args:
+                    visit_expr(arg)
+                if expr.name == "simd_broadcast":
+                    self._register_simd_helper("broadcast", dtype)
+                elif expr.name == "simd_vload":
+                    self._register_simd_helper("load", dtype)
+                elif expr.name == "simd_vgather":
+                    self._register_simd_helper("gather", dtype)
+                elif expr.name == "simd_fma" and is_vector_dtype(dtype):
+                    self._register_simd_helper("fma", dtype)
+                    for arg in expr.args:
+                        if not self._is_vector_expr(arg):
+                            self._register_simd_helper("broadcast", dtype)
+                elif expr.name == "simd_reduce_sum" and expr.args:
+                    arg_dtype = self._dtype_from_expr(expr.args[0])
+                    if is_vector_dtype(arg_dtype):
+                        self._register_simd_helper("reduce_sum", arg_dtype)
+                elif expr.name == "sqrt" and is_vector_dtype(dtype):
+                    self._register_simd_helper("sqrt", dtype)
+                return
+
+        def visit_stmt(stmt: Any):
+            if isinstance(stmt, IRAssign):
+                visit_expr(stmt.target)
+                visit_expr(stmt.value)
+            elif isinstance(stmt, IRCall):
+                visit_expr(stmt.func)
+                for arg in stmt.args:
+                    visit_expr(arg)
+            elif isinstance(stmt, IRIf):
+                visit_expr(stmt.cond)
+                for child in stmt.then:
+                    visit_stmt(child)
+                for child in stmt.else_:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRFor):
+                visit_expr(stmt.start)
+                visit_expr(stmt.stop)
+                visit_expr(stmt.step)
+                for child in stmt.body:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRWhile):
+                visit_expr(stmt.cond)
+                for child in stmt.body:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRReturn):
+                visit_expr(stmt.value)
+            elif isinstance(stmt, IRPrint):
+                for value in stmt.values:
+                    visit_expr(value)
+            elif isinstance(stmt, IRAllocate):
+                visit_expr(stmt.var)
+                for dim in stmt.dims:
+                    visit_expr(dim)
+            elif isinstance(stmt, IRDeallocate):
+                visit_expr(stmt.var)
+            elif isinstance(stmt, IRSimdStore):
+                visit_expr(stmt.array)
+                visit_expr(stmt.index)
+                visit_expr(stmt.value)
+                value_dtype = self._dtype_from_expr(stmt.value)
+                if not is_vector_dtype(value_dtype):
+                    self._raise_with_source(
+                        TypeError,
+                        "vstore requires a vector value",
+                        origin=stmt,
+                    )
+                self._register_simd_helper("store", value_dtype)
+
+        for stmt in proc.body:
+            visit_stmt(stmt)
+
     def emit_namespace(self, namespace: Namespace) -> tuple[str, bool]:
         self._array_info = {}
-        self._pointer_args = {}
         self._shape_arg_map = {}
+        self._symbols = {}
         self._tmp_counter = 0
-        self._pointer_locals = set()
         self._requires_math = False
         self._reduction_helpers = {}
+        self._vector_types = set()
+        self._simd_helpers_needed = set()
 
         lines: list[str] = []
         lines.append("#include <Python.h>\n")
@@ -210,7 +457,7 @@ class CEmitter:
 
         return "".join(lines), self._requires_math
 
-    def _render_global_variable(self, var: Variable) -> list[str]:
+    def _render_global_variable(self, var: Variable, *, weak: bool = False) -> list[str]:
         lines = []
         shape = var._shape
         dtype = var.dtype
@@ -218,10 +465,11 @@ class CEmitter:
             return []
         ctype = dtype.get_cnumpy()
         assign = var.assign
+        prefix = "__attribute__((weak)) const" if weak else "const"
 
         if shape is None or shape.is_unknown or shape.rank == 0:
             value = self._render_literal(assign)
-            lines.append(f"const {ctype} {var.name} = {value};\n")
+            lines.append(f"{prefix} {ctype} {var.name} = {value};\n")
             return lines
 
         fortran_order = shape.fortran_order
@@ -239,10 +487,40 @@ class CEmitter:
             return []
 
         size = len(values)
-        lines.append(f"const {ctype} {var.name}[{size}] = {{")
+        lines.append(f"{prefix} {ctype} {var.name}[{size}] = {{")
         lines.append(", ".join(values))
         lines.append("};\n")
         return lines
+
+    def _render_global_variable_declaration(self, var: Variable) -> list[str]:
+        shape = var._shape
+        dtype = var.dtype
+        if dtype is None:
+            return []
+        ctype = dtype.get_cnumpy()
+
+        if shape is None or shape.is_unknown or shape.rank == 0:
+            return [f"extern const {ctype} {var.name};\n"]
+
+        size = self._global_variable_size(var)
+        suffix = "[]" if size is None else f"[{size}]"
+        return [f"extern const {ctype} {var.name}{suffix};\n"]
+
+    @staticmethod
+    def _global_variable_size(var: Variable) -> int | None:
+        assign = var.assign
+        if isinstance(assign, np.ndarray):
+            return int(assign.size)
+
+        shape = var._shape
+        if shape is None or shape.is_unknown or shape.rank == 0:
+            return None
+        size = 1
+        for dim in shape.iter_dims():
+            if not isinstance(dim, int):
+                return None
+            size *= dim
+        return size
 
     def _collect_global_constants(self, proc: IRProcedure) -> list[str]:
         constants: dict[str, dict[str, Any]] = {}
@@ -315,6 +593,10 @@ class CEmitter:
                 visit_expr(stmt.cond)
                 for child in stmt.body:
                     visit_stmt(child)
+            elif isinstance(stmt, IRSimdStore):
+                visit_expr(stmt.array)
+                visit_expr(stmt.index)
+                visit_expr(stmt.value)
             elif isinstance(stmt, IROpaqueStmt):
                 return
 
@@ -324,23 +606,11 @@ class CEmitter:
         lines: list[str] = []
         for name, item in constants.items():
             source = item["source"]
-            rendered = self._render_global_variable(source)
+            rendered = self._render_global_variable(source, weak=True)
             if not rendered:
                 continue
 
-            # Since _render_global_variable is generic, we might need to adjust for static/const
-            # if we want strictly static const inside the function scope,
-            # but usually global constants are extern/global.
-            # However, the original code used `static const`.
-            # Let's adjust the rendered lines to be `static const` if they are not already.
-
-            # Actually, reusing _render_global_variable which emits `const ...`
-            # and prefixing `static` here is tricky with list of strings.
-            # But wait, the previous code emitted `static const`.
-            # My new _render_global_variable emits `const`.
-            # I should probably pass a modifier to _render_global_variable.
-
-            lines.extend([l.replace("const ", "static const ", 1) for l in rendered])
+            lines.extend(rendered)
 
             # We also need to populate self._array_info for arrays so they can be used
             # This logic was inside the loop before.
@@ -441,6 +711,95 @@ class CEmitter:
             return None
         return dtype
 
+    def _register_symbol(self, info: CSymbolInfo) -> CSymbolInfo:
+        self._symbols[info.name] = info
+        return info
+
+    def _symbol_for_var(self, var: IRVar) -> CSymbolInfo | None:
+        return self._symbols.get(var.name)
+
+    def _array_symbol(self, name: str) -> CSymbolInfo | None:
+        symbol = self._symbols.get(name)
+        if symbol is not None and symbol.is_array:
+            return symbol
+        info = self._array_info.get(name)
+        if info is None:
+            return None
+        return self._register_symbol(
+            CSymbolInfo(
+                name=name,
+                ctype=info.get("ctype"),
+                is_array=True,
+                rank=info.get("rank", 0),
+                dims_exprs=list(info.get("dims_exprs", [])),
+                fortran_order=bool(info.get("fortran_order", False)),
+                is_pointer=True,
+            )
+        )
+
+    def _array_info_for_name(self, name: str) -> dict[str, Any] | None:
+        symbol = self._array_symbol(name)
+        if symbol is None or symbol.dims_exprs is None or symbol.ctype is None:
+            return None
+        return {
+            "name": symbol.name,
+            "ctype": symbol.ctype,
+            "rank": symbol.rank,
+            "fortran_order": symbol.fortran_order,
+            "dims_exprs": symbol.dims_exprs,
+            "dims_name": self._array_info.get(name, {}).get("dims_name"),
+        }
+
+    def _procedure_signature_for_call(self, stmt: IRCall) -> CProcedureSignature | None:
+        if not isinstance(stmt.func, IRVarRef) or stmt.func.var is None:
+            return None
+        source = stmt.func.var.source
+        arguments = getattr(source, "arguments", None)
+        if not isinstance(arguments, dict):
+            return None
+        params: list[CParamInfo] = []
+        for name, variable in arguments.items():
+            if name.startswith("shape_"):
+                params.append(CParamInfo(name=name, kind="shape_descriptor", shape_base=name[6:]))
+                continue
+            shape = getattr(variable, "_shape", None)
+            if shape is not None and not getattr(shape, "is_scalar", False):
+                params.append(CParamInfo(name=name, kind="array"))
+            else:
+                params.append(CParamInfo(name=name, kind="scalar"))
+        return CProcedureSignature(name=self._call_name(stmt.func), params=tuple(params))
+
+    def _register_array_symbol(
+        self,
+        name: str,
+        *,
+        ctype: str,
+        rank: int,
+        dims_exprs: list[str],
+        fortran_order: bool,
+        dims_name: str | None = None,
+        is_pointer: bool = False,
+    ) -> None:
+        self._array_info[name] = {
+            "name": name,
+            "ctype": ctype,
+            "rank": rank,
+            "fortran_order": fortran_order,
+            "dims_exprs": dims_exprs,
+            "dims_name": dims_name,
+        }
+        self._register_symbol(
+            CSymbolInfo(
+                name=name,
+                ctype=ctype,
+                is_array=True,
+                rank=rank,
+                dims_exprs=dims_exprs,
+                fortran_order=fortran_order,
+                is_pointer=is_pointer,
+            )
+        )
+
     def _build_signature(self, proc: IRProcedure) -> list[str]:
         arg_specs: list[str] = []
         for var in proc.args:
@@ -450,9 +809,22 @@ class CEmitter:
             if shape is None:
                 ctype = self._map_irvar_to_ctype(var)
                 dtype = self._dtype_from_irvar(var)
+                if is_vector_dtype(dtype):
+                    self._raise_with_source(
+                        NotImplementedError,
+                        "SIMD vector values are only supported as local values, not Python-callable arguments",
+                        origin=var,
+                    )
                 pass_by_value = dtype is not None and var.intent == "in" and dtype.can_be_value()
                 is_pointer = not pass_by_value
-                self._pointer_args[var.name] = is_pointer
+                self._register_symbol(
+                    CSymbolInfo(
+                        name=var.name,
+                        ctype=ctype,
+                        is_pointer=is_pointer,
+                        pass_by_value=pass_by_value,
+                    )
+                )
                 const_prefix = "const " if (var.intent == "in" and is_pointer) else ""
                 ptr = "*" if is_pointer else ""
                 arg_specs.append(f"{const_prefix}{ctype} {ptr}{var.name}")
@@ -477,14 +849,15 @@ class CEmitter:
 
             ctype = self._map_irvar_to_ctype(var)
             arg_specs.append(f"{ctype}* {var.name}")
-            self._array_info[var.name] = {
-                "name": var.name,
-                "ctype": ctype,
-                "rank": rank,
-                "fortran_order": fortran_order,
-                "dims_exprs": dims_exprs,
-                "dims_name": dims_name,
-            }
+            self._register_array_symbol(
+                var.name,
+                ctype=ctype,
+                rank=rank,
+                dims_exprs=dims_exprs,
+                fortran_order=fortran_order,
+                dims_name=dims_name,
+                is_pointer=True,
+            )
 
         return arg_specs
 
@@ -496,11 +869,17 @@ class CEmitter:
             const_prefix = "const " if var.parameter else ""
             if shape is None:
                 if var.pointer:
+                    self._register_symbol(CSymbolInfo(name=var.name, ctype=ctype, is_pointer=True))
                     lines.append(f"{'    ' * indent}{const_prefix}{ctype} *{var.name} = NULL;\n")
                 else:
+                    self._register_symbol(
+                        CSymbolInfo(name=var.name, ctype=ctype, pass_by_value=True)
+                    )
                     init = ""
                     if var.assign is not None:
                         init = f" = {self._render_literal(var.assign)}"
+                    elif ctype.endswith("*"):
+                        init = " = NULL"
                     lines.append(f"{'    ' * indent}{const_prefix}{ctype} {var.name}{init};\n")
                 continue
 
@@ -509,14 +888,15 @@ class CEmitter:
             dims_name = f"{var.name}_dims"
             shape_dims = self._shape_dims_values(shape) or ()
             dims_exprs = [self._render_dim(dim) for dim in shape_dims]
-            self._array_info[var.name] = {
-                "name": var.name,
-                "ctype": ctype,
-                "rank": rank,
-                "fortran_order": fortran_order,
-                "dims_exprs": dims_exprs,
-                "dims_name": dims_name,
-            }
+            self._register_array_symbol(
+                var.name,
+                ctype=ctype,
+                rank=rank,
+                dims_exprs=dims_exprs,
+                fortran_order=fortran_order,
+                dims_name=dims_name,
+                is_pointer=bool(var.pointer),
+            )
             if var.allocatable or var.pointer or self._shape_dims_values(shape) is None:
                 lines.append(f"{'    ' * indent}{ctype} *{var.name} = NULL;\n")
                 continue
@@ -576,7 +956,7 @@ class CEmitter:
                     return self._render_attr_array_assignment(stmt.target, stmt.value, indent)
             if isinstance(stmt.target, IRVarRef) and stmt.target.var is not None:
                 name = stmt.target.var.name
-                info = self._array_info.get(name)
+                info = self._array_info_for_name(name)
                 if info is not None and info.get("rank", 0) > 0:
                     return self._render_array_assignment(name, stmt.value, indent)
                 if isinstance(stmt.value, IRIntrinsic) and stmt.value.name == "dot_product":
@@ -588,6 +968,8 @@ class CEmitter:
             if isinstance(stmt.func, IRVarRef) and stmt.func.var is not None:
                 if stmt.func.var.name == "numpy_allocate":
                     return self._render_numpy_allocate(stmt, indent)
+                if stmt.func.var.name == "numpy_deallocate":
+                    return self._render_numpy_deallocate(stmt, indent)
                 if stmt.func.var.name == "c_f_pointer":
                     return self._render_c_f_pointer(stmt, indent)
                 if not getattr(stmt.func.var.source, "bind_c", True):
@@ -666,7 +1048,7 @@ class CEmitter:
                     origin=stmt,
                 )
             name = var.name
-            info = self._array_info.get(name)
+            info = self._array_info_for_name(name)
             if info is None:
                 return []
             dims = [self._render_expr(dim) for dim in getattr(stmt, "dims", [])]
@@ -688,6 +1070,8 @@ class CEmitter:
             return [f"{'    ' * indent}return {self._render_expr(stmt.value)};\n"]
         if isinstance(stmt, IRPrint):
             return self._render_print(stmt.values, indent)
+        if isinstance(stmt, IRSimdStore):
+            return self._render_simd_store(stmt, indent)
         if isinstance(stmt, IROpaqueStmt):
             payload = stmt.payload
             if payload is not None and payload.__class__.__name__ == "PointerAssignment":
@@ -702,14 +1086,14 @@ class CEmitter:
                     name = pointer.name
                     dims_exprs = [self._render_slice_length(dim) for dim in pointer_shape]
                     ctype = self._map_irvar_to_ctype(IRVar(name=name, vtype=None, source=pointer))
-                    self._array_info[name] = {
-                        "name": name,
-                        "ctype": ctype,
-                        "rank": len(dims_exprs),
-                        "fortran_order": bool(getattr(pointer_shape_info, "fortran_order", False)),
-                        "dims_exprs": dims_exprs,
-                        "dims_name": None,
-                    }
+                    self._register_array_symbol(
+                        name,
+                        ctype=ctype,
+                        rank=len(dims_exprs),
+                        fortran_order=bool(getattr(pointer_shape_info, "fortran_order", False)),
+                        dims_exprs=dims_exprs,
+                        is_pointer=True,
+                    )
                 if pointer is not None and target is not None:
                     target_name = getattr(target, "name", None)
                     if target_name is None:
@@ -718,6 +1102,56 @@ class CEmitter:
                 return []
             return [f"{'    ' * indent}/* unsupported statement */\n"]
         return [f"{'    ' * indent}/* unsupported statement */\n"]
+
+    def _render_simd_store(self, stmt: IRSimdStore, indent: int) -> list[str]:
+        vector_dtype = self._dtype_from_expr(stmt.value)
+        if not is_vector_dtype(vector_dtype):
+            self._raise_with_source(TypeError, "vstore requires a vector value", origin=stmt)
+        base = self._render_simd_array_base(stmt.array)
+        index = self._render_expr(stmt.index)
+        value = self._render_expr(stmt.value)
+        helper = simd_helper_name("store", vector_dtype)
+        return [f"{'    ' * indent}{helper}({base} + ({index}), {value});\n"]
+
+    def _render_simd_array_base(self, expr: IRExpr | None) -> str:
+        if isinstance(expr, IRVarRef) and expr.var is not None:
+            name = expr.var.name
+            info = self._array_info_for_name(name)
+            if info is None or info.get("rank") != 1:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "SIMD load/store/gather currently supports only rank-1 array variables",
+                    origin=expr,
+                )
+            return name
+        self._raise_with_source(
+            NotImplementedError,
+            "SIMD load/store/gather currently supports only rank-1 array variables",
+            origin=expr,
+        )
+
+    def _render_simd_index_array_base(self, expr: IRExpr | None) -> str:
+        if isinstance(expr, IRVarRef) and expr.var is not None:
+            name = expr.var.name
+            info = self._array_info_for_name(name)
+            if info is None or info.get("rank") != 1:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "SIMD gather currently supports only rank-1 index array variables",
+                    origin=expr,
+                )
+            if info.get("ctype") != "npy_int64":
+                self._raise_with_source(
+                    TypeError,
+                    "SIMD gather indices must be int64 arrays",
+                    origin=expr,
+                )
+            return name
+        self._raise_with_source(
+            NotImplementedError,
+            "SIMD gather currently supports only rank-1 index array variables",
+            origin=expr,
+        )
 
     def _render_print(self, values: list[IRExpr], indent: int) -> list[str]:
         fmt_parts: list[str] = []
@@ -794,8 +1228,24 @@ class CEmitter:
         size_name = f"_nm_size_{self._tmp_counter}"
         size_expr = self._render_expr(size_arg)
         pre = f"{'    ' * indent}size_t {size_name} = {size_expr};\n"
+        if not nm_settings.use_numpy_allocator:
+            ptr_expr = self._render_expr(ptr_arg)
+            return [pre, f"{'    ' * indent}{ptr_expr} = malloc({size_name});\n"]
         call = f"{'    ' * indent}numpy_allocate({self._render_call_arg(ptr_arg)}, &{size_name});\n"
         return [pre, call]
+
+    def _render_numpy_deallocate(self, stmt: IRCall, indent: int) -> list[str]:
+        if len(stmt.args) < 1:
+            self._raise_with_source(
+                NotImplementedError,
+                "numpy_deallocate requires pointer",
+                origin=stmt,
+            )
+        ptr_arg = stmt.args[0]
+        ptr_expr = self._render_expr(ptr_arg)
+        if not nm_settings.use_numpy_allocator:
+            return [f"{'    ' * indent}free({ptr_expr});\n"]
+        return [f"{'    ' * indent}numpy_deallocate({self._render_call_arg(ptr_arg)});\n"]
 
     def _call_name(self, func: IRExpr) -> str:
         name = self._render_expr(func)
@@ -820,7 +1270,11 @@ class CEmitter:
                 if arg.var.vtype is not None and arg.var.vtype.shape is not None:
                     call_args.append(self._render_call_arg(arg))
                 else:
-                    call_args.append(f"&{arg.var.name}")
+                    symbol = self._symbol_for_var(arg.var)
+                    if symbol is not None and symbol.is_pointer:
+                        call_args.append(arg.var.name)
+                    else:
+                        call_args.append(f"&{arg.var.name}")
                 continue
             if isinstance(arg, (IRGetItem, IRGetAttr)):
                 call_args.append(f"&({self._render_expr(arg)})")
@@ -854,8 +1308,11 @@ class CEmitter:
         pre_lines: list[str] = []
         post_lines: list[str] = []
         call_args: list[str] = []
+        callee_signature = self._procedure_signature_for_call(stmt)
 
         def needs_implicit_shape_descriptor(arg: IRExpr) -> bool:
+            if not nm_settings.add_shape_descriptors:
+                return False
             if arg.vtype is None or arg.vtype.shape is None:
                 return False
             dims = self._shape_dims_values(arg.vtype.shape) or []
@@ -870,37 +1327,37 @@ class CEmitter:
         def has_explicit_shape_descriptor(arg_idx: int) -> bool:
             if arg_idx == 0:
                 return False
-            prev = stmt.args[arg_idx - 1]
-            if isinstance(prev, IRIntrinsic) and prev.name == "array_constructor":
-                return True
-            if isinstance(prev, IRVarRef) and prev.var is not None:
-                return prev.var.name.startswith("shape_")
-            return False
+            return _is_shape_descriptor_expr(stmt.args[arg_idx - 1])
+
+        def should_emit_shape_descriptor(arg_idx: int, arg: IRExpr, dims: list[str]) -> bool:
+            if not dims:
+                return False
+            if callee_signature is not None:
+                return callee_signature.expects_shape_descriptor_before_call_arg(stmt.args, arg_idx)
+            return needs_implicit_shape_descriptor(arg) and not has_explicit_shape_descriptor(
+                arg_idx
+            )
 
         for idx, arg in enumerate(stmt.args):
             if isinstance(arg, IRGetItem) and any(isinstance(i, IRSlice) for i in arg.indices):
-                temp_name, pre, post = self._materialize_slice(arg, indent)
-                pre_lines.extend(pre)
-                post_lines.extend(post)
                 dims = self._shape_dims_for_expr(arg)
-                if (
-                    dims
-                    and needs_implicit_shape_descriptor(arg)
-                    and not has_explicit_shape_descriptor(idx)
-                ):
+                if should_emit_shape_descriptor(idx, arg, dims):
                     call_args.append(f"(npy_intp[]){{{', '.join(dims)}}}")
-                call_args.append(temp_name)
+                direct_ptr = self._render_contiguous_slice_pointer(arg)
+                if direct_ptr is not None:
+                    call_args.append(direct_ptr)
+                else:
+                    temp_name, pre, post = self._materialize_slice(arg, indent)
+                    pre_lines.extend(pre)
+                    post_lines.extend(post)
+                    call_args.append(temp_name)
                 continue
             if isinstance(arg, IRIntrinsic) and arg.name == "matmul":
                 temp_name, pre, post = self._materialize_matmul(arg, indent)
                 pre_lines.extend(pre)
                 post_lines.extend(post)
                 dims = self._shape_dims_for_expr(arg)
-                if (
-                    dims
-                    and needs_implicit_shape_descriptor(arg)
-                    and not has_explicit_shape_descriptor(idx)
-                ):
+                if should_emit_shape_descriptor(idx, arg, dims):
                     call_args.append(f"(npy_intp[]){{{', '.join(dims)}}}")
                 call_args.append(temp_name)
                 continue
@@ -909,9 +1366,140 @@ class CEmitter:
         call_line = f"{'    ' * indent}{name}({', '.join(call_args)});\n"
         return pre_lines + [call_line] + post_lines
 
+    def _render_contiguous_slice_pointer(self, arg: IRGetItem) -> str | None:
+        if not isinstance(arg.base, IRExpr):
+            return None
+        base_name = self._render_expr(arg.base)
+        info = self._array_info_for_name(base_name)
+        if info is None or info.get("rank") != 1:
+            return None
+        if len(arg.indices) != 1 or not isinstance(arg.indices[0], IRSlice):
+            return None
+        idx = arg.indices[0]
+        if idx.step is not None:
+            step = self._render_expr(idx.step)
+            if step != "1":
+                return None
+        start = "0" if idx.start is None else self._render_expr(idx.start)
+        return f"({base_name}) + ({start})"
+
+    def _render_slice_length_and_index(
+        self,
+        idx: IRSlice,
+        dim_expr: str,
+        loop_var: str,
+        *,
+        origin: IRExpr | None = None,
+    ) -> tuple[str, str]:
+        start = self._render_expr(idx.start) if idx.start is not None else "0"
+        stop = self._render_expr(idx.stop) if idx.stop is not None else dim_expr
+        step = self._render_expr(idx.step) if idx.step is not None else "1"
+        if isinstance(idx.step, IRLiteral) and isinstance(idx.step.value, (int, np.integer)):
+            if int(idx.step.value) <= 0:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "Negative or zero step slicing is not supported by the C backend",
+                    origin=origin or idx,
+                )
+        if idx.step is None or step == "1":
+            return f"({stop}) - ({start})", f"({start}) + {loop_var}"
+        return (
+            f"(({stop}) - ({start}) + ({step}) - 1) / ({step})",
+            f"({start}) + ({step}) * {loop_var}",
+        )
+
+    def _render_slice_index_for_loop(
+        self,
+        idx: IRSlice,
+        loop_var: str,
+        *,
+        origin: IRExpr | None = None,
+    ) -> str:
+        start = self._render_expr(idx.start) if idx.start is not None else "0"
+        step = self._render_expr(idx.step) if idx.step is not None else "1"
+        if isinstance(idx.step, IRLiteral) and isinstance(idx.step.value, (int, np.integer)):
+            if int(idx.step.value) <= 0:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "Negative or zero step slicing is not supported by the C backend",
+                    origin=origin or idx,
+                )
+        if idx.step is None or step == "1":
+            return f"({start}) + {loop_var}"
+        return f"({start}) + ({step}) * {loop_var}"
+
+    def _const_int_expr(self, expr: str) -> int | None:
+        if not re.fullmatch(r"[0-9\s()+\-*/%]+", expr):
+            return None
+        try:
+            value = eval(expr, {"__builtins__": {}}, {})
+        except Exception:
+            return None
+        if isinstance(value, int):
+            return value
+        return None
+
+    @staticmethod
+    def _ctype_size_bytes(ctype: str) -> int | None:
+        sizes = {
+            "npy_bool": 1,
+            "npy_int8": 1,
+            "npy_uint8": 1,
+            "npy_int16": 2,
+            "npy_uint16": 2,
+            "npy_int32": 4,
+            "npy_uint32": 4,
+            "npy_float32": 4,
+            "npy_int64": 8,
+            "npy_uint64": 8,
+            "npy_float64": 8,
+            "npy_complex64": 8,
+            "npy_complex128": 16,
+            "double": 8,
+            "float": 4,
+            "long long": 8,
+        }
+        return sizes.get(ctype)
+
+    def _render_temp_buffer(
+        self,
+        name: str,
+        ctype: str,
+        size_expr: str,
+        indent: int,
+        *,
+        origin: IRExpr | None = None,
+    ) -> tuple[list[str], list[str]]:
+        policy = nm_settings.c_temporary_allocation
+        const_size = self._const_int_expr(size_expr)
+        use_stack = False
+
+        if policy == "stack":
+            if const_size is None and not nm_settings.c_allow_vla_temporaries:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "C stack temporary allocation for runtime-sized buffers requires "
+                    "nm.settings.c_allow_vla_temporaries=True",
+                    origin=origin,
+                )
+            use_stack = True
+        elif policy == "auto" and const_size is not None:
+            ctype_size = self._ctype_size_bytes(ctype)
+            if ctype_size is not None:
+                use_stack = const_size * ctype_size <= nm_settings.c_stack_temporary_max_bytes
+
+        if use_stack:
+            return [f"{'    ' * indent}{ctype} {name}[{size_expr}];\n"], []
+
+        pre = [
+            f"{'    ' * indent}{ctype} *{name} = ({ctype}*)malloc(sizeof({ctype}) * {size_expr});\n"
+        ]
+        post = [f"{'    ' * indent}free({name});\n"]
+        return pre, post
+
     def _materialize_slice(self, arg: IRGetItem, indent: int) -> tuple[str, list[str], list[str]]:
         base_name = self._render_expr(arg.base)
-        info = self._array_info.get(base_name)
+        info = self._array_info_for_name(base_name)
         if info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -932,18 +1520,9 @@ class CEmitter:
             loop_var = f"_nm_i{dim_idx}"
             loop_indices.append(loop_var)
             if isinstance(idx, IRSlice):
-                start = self._render_expr(idx.start) if idx.start is not None else "0"
-                step = self._render_expr(idx.step) if idx.step is not None else "1"
-                if idx.stop is None:
-                    stop = dims_exprs[dim_idx]
-                else:
-                    stop = self._render_expr(idx.stop)
-                if idx.step is None or step == "1":
-                    length = f"({stop}) - ({start})"
-                    src_idx = f"({start}) + {loop_var}"
-                else:
-                    length = f"(({stop}) - ({start}) + ({step}) - 1) / ({step})"
-                    src_idx = f"({start}) + ({step}) * {loop_var}"
+                length, src_idx = self._render_slice_length_and_index(
+                    idx, dims_exprs[dim_idx], loop_var, origin=arg
+                )
                 slice_dims.append(length)
                 src_indices.append(src_idx)
             else:
@@ -953,9 +1532,9 @@ class CEmitter:
         self._tmp_counter += 1
         temp_name = f"_nm_tmp_{self._tmp_counter}"
         size = self._render_product(slice_dims)
-        pre_lines = [
-            f"{'    ' * indent}{ctype} *{temp_name} = ({ctype}*)malloc(sizeof({ctype}) * {size});\n"
-        ]
+        pre_lines, dealloc_lines = self._render_temp_buffer(
+            temp_name, ctype, size, indent, origin=arg
+        )
 
         pre_lines.extend(
             self._render_slice_copy(
@@ -984,7 +1563,7 @@ class CEmitter:
                 reverse=True,
             )
         )
-        post_lines.append(f"{'    ' * indent}free({temp_name});\n")
+        post_lines.extend(dealloc_lines)
 
         return temp_name, pre_lines, post_lines
 
@@ -1000,6 +1579,8 @@ class CEmitter:
         indent: int,
         reverse: bool = False,
     ) -> list[str]:
+        src_linear = self._linear_index(src_indices, dims_exprs, fortran_order)
+        dst_linear = self._linear_index(loop_indices, slice_dims, False)
         lines: list[str] = []
         loop_indent = indent
         for loop_var, dim in zip(loop_indices, slice_dims):
@@ -1008,8 +1589,6 @@ class CEmitter:
             )
             loop_indent += 1
 
-        src_linear = self._linear_index(src_indices, dims_exprs, fortran_order)
-        dst_linear = self._linear_index(loop_indices, slice_dims, False)
         if reverse:
             lines.append(
                 f"{'    ' * loop_indent}({base_name})[{src_linear}] = ({temp_name})[{dst_linear}];\n"
@@ -1069,9 +1648,9 @@ class CEmitter:
         size = self._render_product(dims)
         ctype = self._map_irvar_to_ctype(IRVar(name=temp_name, vtype=expr.vtype))
 
-        pre_lines = [
-            f"{'    ' * indent}{ctype} *{temp_name} = ({ctype}*)malloc(sizeof({ctype}) * {size});\n"
-        ]
+        pre_lines, post_lines = self._render_temp_buffer(
+            temp_name, ctype, size, indent, origin=expr
+        )
 
         i_var = f"_nm_i{self._tmp_counter}"
         j_var = f"_nm_j{self._tmp_counter}"
@@ -1088,9 +1667,9 @@ class CEmitter:
         left_info = None
         right_info = None
         if isinstance(left, IRVarRef) and left.var is not None:
-            left_info = self._array_info.get(left.var.name)
+            left_info = self._array_info_for_name(left.var.name)
         if isinstance(right, IRVarRef) and right.var is not None:
-            right_info = self._array_info.get(right.var.name)
+            right_info = self._array_info_for_name(right.var.name)
         if left_info is None or right_info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -1121,7 +1700,6 @@ class CEmitter:
         pre_lines.append(f"{'    ' * (indent + 1)}}}\n")
         pre_lines.append(f"{'    ' * indent}}}\n")
 
-        post_lines = [f"{'    ' * indent}free({temp_name});\n"]
         return temp_name, pre_lines, post_lines
 
     def _render_call_arg(self, arg: IRExpr) -> str:
@@ -1131,9 +1709,10 @@ class CEmitter:
             return f"&({self._render_expr(arg)})"
         if isinstance(arg, IRVarRef) and arg.var is not None:
             name = arg.var.name
-            if name in self._shape_arg_map:
-                return f"{self._shape_arg_map[name]}_dims"
-            if self._pointer_args.get(name, False):
+            symbol = self._symbol_for_var(arg.var)
+            if symbol is not None and symbol.is_shape_descriptor:
+                return f"{symbol.shape_base}_dims"
+            if symbol is not None and symbol.is_pointer:
                 return name
             is_scalar = arg.var.vtype is None or arg.var.vtype.shape is None
             if not is_scalar or arg.var.pass_by_value:
@@ -1171,7 +1750,7 @@ class CEmitter:
         ctype = self._map_irvar_to_ctype(target.var)
         lines = [f"{'    ' * indent}{target_name} = ({ctype}*)({source_expr});\n"]
 
-        self._pointer_locals.add(target_name)
+        self._register_symbol(CSymbolInfo(name=target_name, ctype=ctype, is_pointer=True))
 
         shape_arg = stmt.args[2] if len(stmt.args) > 2 else None
         if shape_arg is not None:
@@ -1181,14 +1760,14 @@ class CEmitter:
             else:
                 dims_exprs = [self._render_expr(shape_arg)]
             if dims_exprs:
-                self._array_info[target_name] = {
-                    "name": target_name,
-                    "ctype": ctype,
-                    "rank": len(dims_exprs),
-                    "fortran_order": False,
-                    "dims_exprs": dims_exprs,
-                    "dims_name": None,
-                }
+                self._register_array_symbol(
+                    target_name,
+                    ctype=ctype,
+                    rank=len(dims_exprs),
+                    dims_exprs=dims_exprs,
+                    fortran_order=False,
+                    is_pointer=True,
+                )
                 return lines
 
         src_arg = None
@@ -1198,7 +1777,7 @@ class CEmitter:
             src_arg = source
 
         if isinstance(src_arg, IRVarRef) and src_arg.var is not None:
-            src_info = self._array_info.get(src_arg.var.name)
+            src_info = self._array_info_for_name(src_arg.var.name)
             if src_info is not None:
                 src_dtype = self._dtype_from_irvar(src_arg.var)
                 target_dtype = self._dtype_from_irvar(target.var)
@@ -1216,28 +1795,28 @@ class CEmitter:
                     ):
                         total = self._render_product(src_info["dims_exprs"])
                         scaled = f"(({total})*{src_bytes})/({target_bytes})"
-                        self._array_info[target_name] = {
-                            "name": target_name,
-                            "ctype": ctype,
-                            "rank": 1,
-                            "fortran_order": False,
-                            "dims_exprs": [scaled],
-                            "dims_name": None,
-                        }
+                        self._register_array_symbol(
+                            target_name,
+                            ctype=ctype,
+                            rank=1,
+                            dims_exprs=[scaled],
+                            fortran_order=False,
+                            is_pointer=True,
+                        )
                         return lines
-                self._array_info[target_name] = {
-                    "name": target_name,
-                    "ctype": ctype,
-                    "rank": src_info["rank"],
-                    "fortran_order": src_info["fortran_order"],
-                    "dims_exprs": src_info["dims_exprs"],
-                    "dims_name": None,
-                }
+                self._register_array_symbol(
+                    target_name,
+                    ctype=ctype,
+                    rank=src_info["rank"],
+                    dims_exprs=list(src_info["dims_exprs"]),
+                    fortran_order=src_info["fortran_order"],
+                    is_pointer=True,
+                )
 
         return lines
 
     def _render_array_assignment(self, name: str, value: IRExpr | None, indent: int) -> list[str]:
-        info = self._array_info.get(name)
+        info = self._array_info_for_name(name)
         if info is None:
             return []
         rank = info.get("rank", 0)
@@ -1297,8 +1876,8 @@ class CEmitter:
                 "dot_product requires array variables",
                 origin=expr,
             )
-        left_info = self._array_info.get(left.var.name if left.var else "")
-        right_info = self._array_info.get(right.var.name if right.var else "")
+        left_info = self._array_info_for_name(left.var.name if left.var else "")
+        right_info = self._array_info_for_name(right.var.name if right.var else "")
         if left_info is None or right_info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -1344,7 +1923,7 @@ class CEmitter:
                 "transpose requires array variable",
                 origin=expr,
             )
-        src_info = self._array_info.get(src.var.name)
+        src_info = self._array_info_for_name(src.var.name)
         if src_info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -1392,8 +1971,8 @@ class CEmitter:
                 origin=expr,
             )
 
-        left_info = self._array_info.get(left.var.name if left.var else "")
-        right_info = self._array_info.get(right.var.name if right.var else "")
+        left_info = self._array_info_for_name(left.var.name if left.var else "")
+        right_info = self._array_info_for_name(right.var.name if right.var else "")
         if left_info is None or right_info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -1434,7 +2013,7 @@ class CEmitter:
         self, target: IRGetItem, value: IRExpr | None, indent: int
     ) -> list[str]:
         base_name = self._render_expr(target.base)
-        info = self._array_info.get(base_name)
+        info = self._array_info_for_name(base_name)
         if info is None:
             self._raise_with_source(
                 NotImplementedError,
@@ -1443,36 +2022,28 @@ class CEmitter:
             )
 
         indices: list[str] = []
-        loops: list[tuple[str, str, str, str]] = []
+        loops: list[tuple[str, str]] = []
         for dim_idx, idx in enumerate(target.indices):
             if isinstance(idx, IRSlice):
                 var = f"i_{dim_idx}"
-                start = self._render_expr(idx.start) if idx.start is not None else "0"
-                stop = (
-                    self._render_expr(idx.stop)
-                    if idx.stop is not None
-                    else info["dims_exprs"][dim_idx]
+                length, target_index = self._render_slice_length_and_index(
+                    idx, info["dims_exprs"][dim_idx], var, origin=target
                 )
-                step = self._render_expr(idx.step) if idx.step is not None else "1"
-                loops.append((var, start, stop, step))
-                indices.append(var)
+                loops.append((var, length))
+                indices.append(target_index)
             else:
                 indices.append(self._render_expr(cast(IRExpr, idx)))
 
-        loop_indices = [var for var, _, _, _ in loops]
+        loop_indices = [var for var, _ in loops]
         linear = self._linear_index(indices, info["dims_exprs"], info["fortran_order"])
         value_expr = self._render_expr_with_slice(value, loop_indices)
 
         lines: list[str] = []
         loop_indent = indent
-        for var, start, stop, step in loops:
-            condition = "<"
-            if step.startswith("-"):
-                condition = ">"
-            init = f"npy_intp {var} = {start}"
-            cond = f"{var} {condition} {stop}"
-            incr = f"{var} += {step}" if step != "1" else f"{var}++"
-            lines.append(f"{'    ' * loop_indent}for ({init}; {cond}; {incr}) {{\n")
+        for var, length in loops:
+            lines.append(
+                f"{'    ' * loop_indent}for (npy_intp {var} = 0; {var} < {length}; {var}++) {{\n"
+            )
             loop_indent += 1
 
         lines.append(f"{'    ' * loop_indent}({base_name})[{linear}] = {value_expr};\n")
@@ -1488,33 +2059,43 @@ class CEmitter:
             return ""
         if isinstance(expr, IRVarRef) and expr.var is not None:
             name = expr.var.name
-            info = self._array_info.get(name)
+            info = self._array_info_for_name(name)
             if info is not None and loop_vars:
                 linear = self._linear_index(loop_vars, info["dims_exprs"], info["fortran_order"])
                 return f"({name})[{linear}]"
         if isinstance(expr, IRGetItem):
-            if not any(isinstance(i, IRSlice) for i in expr.indices):
-                return self._render_getitem(expr)
             base_name = self._render_expr(expr.base)
-            info = self._array_info.get(base_name)
+            info = self._array_info_for_name(base_name)
             if info is None:
                 return self._render_getitem(expr)
             indices: list[str] = []
             loop_iter = iter(loop_vars)
             for idx in expr.indices:
                 if isinstance(idx, IRSlice):
-                    start = self._render_expr(idx.start) if idx.start is not None else "0"
                     loop_var = next(loop_iter, "0")
-                    indices.append(f"({start}) + {loop_var}")
+                    indices.append(self._render_slice_index_for_loop(idx, loop_var, origin=expr))
                 else:
-                    indices.append(self._render_expr(cast(IRExpr, idx)))
+                    self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
+                    indices.append(self._render_expr_with_slice(cast(IRExpr, idx), loop_vars))
             linear = self._linear_index(indices, info["dims_exprs"], info["fortran_order"])
             return f"({base_name})[{linear}]"
+        if isinstance(expr, IRGetAttr):
+            shape = expr.vtype.shape if expr.vtype is not None else None
+            dims = self._shape_dims_values(shape) if shape is not None else None
+            if dims is not None and loop_vars:
+                dims_exprs = [self._render_dim(dim) for dim in dims]
+                linear = self._linear_index(loop_vars, dims_exprs, shape.order == "F")
+                return f"({self._render_attr_access(expr)})[{linear}]"
         if isinstance(expr, IRBinary):
+            if self._is_vector_expr(expr):
+                return self._render_vector_binary(expr)
             op = _C_BINARY_OPS.get(expr.op, expr.op)
             if op == "**":
-                self._requires_math = True
-                return f"pow({self._render_expr_with_slice(expr.left, loop_vars)}, {self._render_expr_with_slice(expr.right, loop_vars)})"
+                return self._render_power(
+                    expr.left,
+                    expr.right,
+                    lambda arg: self._render_expr_with_slice(arg, loop_vars),
+                )
             return f"({self._render_expr_with_slice(expr.left, loop_vars)} {op} {self._render_expr_with_slice(expr.right, loop_vars)})"
         if isinstance(expr, IRUnary):
             if expr.op == "neg":
@@ -1530,7 +2111,74 @@ class CEmitter:
                 return self._render_expr(arg0)
             args = ", ".join(self._render_expr_with_slice(arg, loop_vars) for arg in expr.args)
             return f"{name}({args})"
+        if isinstance(expr, IRIntrinsic):
+            return self._render_intrinsic(
+                expr,
+                arg_renderer=lambda arg: self._render_expr_with_slice(arg, loop_vars),
+            )
         return self._render_expr(expr)
+
+    def _render_vector_binary(self, expr: IRBinary) -> str:
+        vector_dtype = self._dtype_from_expr(expr)
+        if not is_vector_dtype(vector_dtype):
+            return self._render_expr(expr)
+        if expr.op not in {"add", "sub", "mul", "div"}:
+            self._raise_with_source(
+                NotImplementedError,
+                f"Vector operation {expr.op!r} is not supported by the C backend",
+                origin=expr,
+            )
+        helper = simd_helper_name(expr.op, vector_dtype)
+        left = self._render_vector_operand(expr.left, vector_dtype)
+        right = self._render_vector_operand(expr.right, vector_dtype)
+        return f"{helper}({left}, {right})"
+
+    def _render_vector_operand(self, expr: IRExpr | None, vector_dtype) -> str:
+        rendered = self._render_expr(expr)
+        if self._is_vector_expr(expr):
+            return rendered
+        helper = simd_helper_name("broadcast", vector_dtype)
+        return f"{helper}({rendered})"
+
+    def _ensure_scalar_subscript_index(self, idx: IRExpr, *, origin: IRExpr | None = None) -> None:
+        if is_vector_dtype(self._dtype_from_expr(idx)):
+            self._raise_with_source(
+                NotImplementedError,
+                "C backend does not support vector-valued array indices yet",
+                origin=origin or idx,
+            )
+
+        if isinstance(idx, IRVarRef) and idx.var is not None:
+            info = self._array_info_for_name(idx.var.name)
+            if info is not None and info.get("rank", 0) > 0:
+                self._raise_with_source(
+                    NotImplementedError,
+                    "C backend does not support array-valued slice expressions as scalar subscripts",
+                    origin=origin or idx,
+                )
+            source_shape = getattr(idx.var.source, "_shape", None)
+            if source_shape is not None and not getattr(source_shape, "is_scalar", False):
+                self._raise_with_source(
+                    NotImplementedError,
+                    "C backend does not support array-valued slice expressions as scalar subscripts",
+                    origin=origin or idx,
+                )
+
+        shape = idx.vtype.shape if idx.vtype is not None else None
+        rank = getattr(shape, "rank", None)
+        if rank not in (None, 0):
+            self._raise_with_source(
+                NotImplementedError,
+                "C backend does not support array-valued slice expressions as scalar subscripts",
+                origin=origin or idx,
+            )
+
+        if isinstance(idx, IRGetItem) and any(isinstance(inner, IRSlice) for inner in idx.indices):
+            self._raise_with_source(
+                NotImplementedError,
+                "C backend does not support array-valued slice expressions as scalar subscripts",
+                origin=origin or idx,
+            )
 
     def _render_expr(self, expr: IRExpr | None) -> str:
         if expr is None:
@@ -1541,18 +2189,18 @@ class CEmitter:
             if expr.var is None:
                 return ""
             name = expr.var.name
-            if name in self._shape_arg_map:
-                return f"{self._shape_arg_map[name]}_dims"
-            if self._pointer_args.get(name, False):
-                return f"(*{name})"
-            if name in self._pointer_locals:
+            symbol = self._symbol_for_var(expr.var)
+            if symbol is not None and symbol.is_shape_descriptor:
+                return f"{symbol.shape_base}_dims"
+            if symbol is not None and symbol.is_scalar_pointer:
                 return f"(*{name})"
             return name
         if isinstance(expr, IRBinary):
+            if self._is_vector_expr(expr):
+                return self._render_vector_binary(expr)
             op = _C_BINARY_OPS.get(expr.op, expr.op)
             if op == "**":
-                self._requires_math = True
-                return f"pow({self._render_expr(expr.left)}, {self._render_expr(expr.right)})"
+                return self._render_power(expr.left, expr.right, self._render_expr)
             return f"({self._render_expr(expr.left)} {op} {self._render_expr(expr.right)})"
         if isinstance(expr, IRUnary):
             if expr.op == "neg":
@@ -1635,7 +2283,7 @@ class CEmitter:
                         origin=expr,
                     )
                 return f"{base_name}[{self._render_expr(cast(IRExpr, idx0))}]"
-        info = self._array_info.get(base_name)
+        info = self._array_info_for_name(base_name)
         if info is None:
             if isinstance(expr.base, IRVarRef) and expr.base.var is not None:
                 shape = expr.base.var.vtype.shape if expr.base.var.vtype is not None else None
@@ -1644,17 +2292,18 @@ class CEmitter:
                         self._render_dim(dim) for dim in (self._shape_dims_values(shape) or ())
                     ]
                     indices: list[str] = []
-                    for idx in expr.indices:
-                        if isinstance(idx, IRSlice):
-                            start_expr = idx.start
-                            if start_expr is None:
-                                indices.append("0")
-                            else:
-                                indices.append(self._render_expr(start_expr))
-                            continue
-                        indices.append(self._render_expr(cast(IRExpr, idx)))
-                    linear = self._linear_index(indices, dims_exprs, shape.order == "F")
-                    return f"({base_name})[{linear}]"
+                for idx in expr.indices:
+                    if isinstance(idx, IRSlice):
+                        start_expr = idx.start
+                        if start_expr is None:
+                            indices.append("0")
+                        else:
+                            indices.append(self._render_expr(start_expr))
+                        continue
+                    self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
+                    indices.append(self._render_expr(cast(IRExpr, idx)))
+                linear = self._linear_index(indices, dims_exprs, shape.order == "F")
+                return f"({base_name})[{linear}]"
             if isinstance(expr.base, IRGetAttr):
                 shape = expr.base.vtype.shape if expr.base.vtype is not None else None
                 if shape is not None and self._shape_dims_values(shape) is not None:
@@ -1670,6 +2319,7 @@ class CEmitter:
                             else:
                                 indices.append(self._render_expr(start_expr))
                             continue
+                        self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
                         indices.append(self._render_expr(cast(IRExpr, idx)))
                     linear = self._linear_index(indices, dims_exprs, shape.order == "F")
                     return f"({base_name})[{linear}]"
@@ -1687,6 +2337,7 @@ class CEmitter:
                 else:
                     indices.append(self._render_expr(start_expr))
                 continue
+            self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
             indices.append(self._render_expr(cast(IRExpr, idx)))
         linear = self._linear_index(indices, info["dims_exprs"], info["fortran_order"])
         return f"({base_name})[{linear}]"
@@ -1696,7 +2347,7 @@ class CEmitter:
         base_name = getattr(base, "name", None)
         if base_name is None:
             return ""
-        info = self._array_info.get(base_name)
+        info = self._array_info_for_name(base_name)
         if info is None:
             return base_name
 
@@ -1724,23 +2375,23 @@ class CEmitter:
             if shape_dims is not None:
                 if any(dim is None for dim in shape_dims):
                     if isinstance(expr, IRVarRef) and expr.var is not None:
-                        info = self._array_info.get(expr.var.name)
+                        info = self._array_info_for_name(expr.var.name)
                         if info is not None:
                             return list(info["dims_exprs"])
                 rendered = [self._render_dim(dim) for dim in shape_dims]
                 if any(not dim for dim in rendered):
                     if isinstance(expr, IRVarRef) and expr.var is not None:
-                        info = self._array_info.get(expr.var.name)
+                        info = self._array_info_for_name(expr.var.name)
                         if info is not None:
                             return list(info["dims_exprs"])
                 return rendered
         if isinstance(expr, IRVarRef) and expr.var is not None:
-            info = self._array_info.get(expr.var.name)
+            info = self._array_info_for_name(expr.var.name)
             if info is not None:
                 return list(info["dims_exprs"])
         if isinstance(expr, IRGetItem):
             base_name = self._render_expr(expr.base)
-            info = self._array_info.get(base_name)
+            info = self._array_info_for_name(base_name)
             if info is None:
                 return []
             dims: list[str] = []
@@ -1764,7 +2415,8 @@ class CEmitter:
         base = expr.base
         if isinstance(base, IRVarRef) and base.var is not None:
             name = base.var.name
-            if self._pointer_args.get(name, False) or name in self._pointer_locals:
+            symbol = self._symbol_for_var(base.var)
+            if symbol is not None and symbol.is_pointer:
                 return f"{name}->{expr.name}"
             return f"{name}.{expr.name}"
         return f"{self._render_expr(base)}.{expr.name}"
@@ -1796,7 +2448,7 @@ class CEmitter:
             loop_indent += 1
 
         linear = self._linear_index(indices, dims, False)
-        rhs = self._render_expr(value)
+        rhs = self._render_expr_with_slice(value, indices)
         lines.append(f"{'    ' * loop_indent}{base_ptr}[{linear}] = {rhs};\n")
 
         for _ in indices:
@@ -1924,9 +2576,50 @@ class CEmitter:
                 return None
         return base_name
 
-    def _render_intrinsic(self, expr: IRIntrinsic) -> str:
+    def _render_intrinsic(self, expr: IRIntrinsic, arg_renderer=None) -> str:
         name = expr.name
-        args = [self._render_expr(arg) for arg in expr.args]
+        if arg_renderer is None:
+            arg_renderer = self._render_expr
+        args = [arg_renderer(arg) for arg in expr.args]
+        if name == "simd_broadcast":
+            vector_dtype = self._dtype_from_expr(expr)
+            helper = simd_helper_name("broadcast", vector_dtype)
+            return f"{helper}({args[0]})"
+        if name == "simd_vload":
+            vector_dtype = self._dtype_from_expr(expr)
+            helper = simd_helper_name("load", vector_dtype)
+            base = self._render_simd_array_base(expr.args[0] if expr.args else None)
+            index = args[1] if len(args) > 1 else "0"
+            return f"{helper}({base} + ({index}))"
+        if name == "simd_vgather":
+            vector_dtype = self._dtype_from_expr(expr)
+            helper = simd_helper_name("gather", vector_dtype)
+            base = self._render_simd_array_base(expr.args[0] if expr.args else None)
+            index_base = self._render_simd_index_array_base(
+                expr.args[1] if len(expr.args) > 1 else None
+            )
+            offset = args[2] if len(args) > 2 else "0"
+            return f"{helper}({base} + ({offset}), {index_base})"
+        if name == "simd_fma":
+            vector_dtype = self._dtype_from_expr(expr)
+            if is_vector_dtype(vector_dtype):
+                helper = simd_helper_name("fma", vector_dtype)
+                rendered_args = [
+                    self._render_vector_operand(arg, vector_dtype) for arg in expr.args
+                ]
+                return f"{helper}({', '.join(rendered_args)})"
+            return f"(({args[0]}) * ({args[1]}) + ({args[2]}))"
+        if name == "simd_reduce_sum":
+            if not expr.args:
+                return "0"
+            vector_dtype = self._dtype_from_expr(expr.args[0])
+            helper = simd_helper_name("reduce_sum", vector_dtype)
+            return f"{helper}({args[0]})"
+        if name == "sqrt" and is_vector_dtype(self._dtype_from_expr(expr)):
+            self._requires_math = True
+            vector_dtype = self._dtype_from_expr(expr)
+            helper = simd_helper_name("sqrt", vector_dtype)
+            return f"{helper}({args[0]})"
         if name == "array_constructor":
             return f"(npy_intp[]){{{', '.join(args)}}}"
         if name == "shape":
@@ -1950,7 +2643,7 @@ class CEmitter:
                 except (ValueError, TypeError):
                     dim_index = None
             if isinstance(base, IRVarRef) and base.var is not None:
-                info = self._array_info.get(base.var.name)
+                info = self._array_info_for_name(base.var.name)
                 if info is not None:
                     if dim_index is not None and 1 <= dim_index <= len(info["dims_exprs"]):
                         return info["dims_exprs"][dim_index - 1]
@@ -1963,7 +2656,7 @@ class CEmitter:
                 return "0"
             base = expr.args[0]
             if isinstance(base, IRVarRef) and base.var is not None:
-                info = self._array_info.get(base.var.name)
+                info = self._array_info_for_name(base.var.name)
                 if info is not None:
                     return str(info.get("rank", 0))
             return "0"
@@ -1972,7 +2665,7 @@ class CEmitter:
                 return "0"
             base = expr.args[0]
             if isinstance(base, IRVarRef) and base.var is not None:
-                info = self._array_info.get(base.var.name)
+                info = self._array_info_for_name(base.var.name)
                 if info is not None:
                     total = self._render_product(info["dims_exprs"])
                     helper_name = self._register_reduction_helper(name, info["ctype"])
@@ -2104,6 +2797,21 @@ class CEmitter:
         if name == "trailz":
             return f"(({args[0]}) == 0 ? 64 : __builtin_ctzll((unsigned long long)({args[0]})))"
         return f"{name}({', '.join(args)})"
+
+    def _render_power(self, left: IRExpr | None, right: IRExpr | None, renderer) -> str:
+        if isinstance(right, IRLiteral) and isinstance(right.value, (int, np.integer)):
+            exponent = int(right.value)
+            if exponent == 0:
+                return "1"
+            base = renderer(left)
+            if exponent == 1:
+                return base
+            if exponent == 2:
+                return f"(({base}) * ({base}))"
+            if exponent == 3:
+                return f"(({base}) * ({base}) * ({base}))"
+        self._requires_math = True
+        return f"pow({renderer(left)}, {renderer(right)})"
 
     def _map_irvar_to_ctype(self, var: IRVar) -> str:
         source: Any = var.source

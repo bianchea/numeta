@@ -16,6 +16,9 @@ class IRType:
     kind: str | None = None
     bitwidth: int | None = None
     struct: "IRStruct | None" = None
+    is_vector: bool = False
+    vector_lanes: int | None = None
+    vector_base: "IRType | None" = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,14 @@ class IRAllocate(IRStmt):
 @dataclass
 class IRDeallocate(IRStmt):
     var: IRExpr | None = None
+
+
+@dataclass
+class IRSimdStore(IRStmt):
+    array: IRExpr | None = None
+    index: IRExpr | None = None
+    value: IRExpr | None = None
+    aligned: bool = False
 
 
 @dataclass

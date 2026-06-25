@@ -34,6 +34,8 @@ class NumetaCompiledFunction(ExternalLibrary):
         do_checks: bool | None = None,
         compile_flags: str | Iterable[str] | None = None,
         backend: str | None = None,
+        simd_arch: str | None = None,
+        simd_features: Iterable[str] | str | None = None,
     ):
         """
         Has to be linked at runtime
@@ -54,6 +56,14 @@ class NumetaCompiledFunction(ExternalLibrary):
         if backend is None:
             backend = settings.default_backend
         self.backend = backend
+        if simd_arch is None:
+            simd_arch = settings.default_simd_arch
+        self.simd_arch = simd_arch
+        if simd_features is None:
+            simd_features = settings.default_simd_features
+        elif isinstance(simd_features, str):
+            simd_features = (simd_features,)
+        self.simd_features = tuple(str(feature).lower() for feature in simd_features)
         self._requires_math = False
         resolved_flags = settings.default_compile_flags if compile_flags is None else compile_flags
         self.compile_flags = Compiler._normalize_flags(resolved_flags)
@@ -148,7 +158,7 @@ class NumetaCompiledFunction(ExternalLibrary):
 
                 compiler = Compiler("gcc", self.compile_flags)
                 c_src = self._path / f"{obj_name}_src.c"
-                emitter = CEmitter()
+                emitter = CEmitter(simd_arch=self.simd_arch, simd_features=self.simd_features)
                 if isinstance(self.symbolic_function, Namespace):
                     c_code, requires_math = emitter.emit_namespace(self.symbolic_function)
                 else:
@@ -307,6 +317,8 @@ class NumetaFunction(BaseFunction):
         namer=None,
         inline: bool | int = False,
         backend: str | None = None,
+        simd_arch: str | None = None,
+        simd_features: Iterable[str] | str | None = None,
     ) -> None:
         ExternalLibrary.__init__(self, func.__name__, to_link=True)
         self.name = func.__name__
@@ -322,6 +334,14 @@ class NumetaFunction(BaseFunction):
         if backend is None:
             backend = settings.default_backend
         self.backend = backend
+        if simd_arch is None:
+            simd_arch = settings.default_simd_arch
+        self.simd_arch = simd_arch
+        if simd_features is None:
+            simd_features = settings.default_simd_features
+        elif isinstance(simd_features, str):
+            simd_features = (simd_features,)
+        self.simd_features = tuple(str(feature).lower() for feature in simd_features)
 
         self.namer = namer
         self.inline = inline
@@ -693,6 +713,8 @@ class NumetaFunction(BaseFunction):
             do_checks=self.do_checks,
             compile_flags=self.compile_flags,
             backend=self.backend,
+            simd_arch=self.simd_arch,
+            simd_features=self.simd_features,
         )
 
         symbolic_fun.parent = self._compiled_functions[signature]

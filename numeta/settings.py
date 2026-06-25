@@ -170,8 +170,13 @@ class Settings:
         default_do_checks=True,
         track_source_location=True,
         default_compile_flags="-O3 -march=native",
+        default_simd_arch="scalar",
+        default_simd_features=(),
         use_c_dispatch=True,
         use_c_signature_parser=True,
+        c_temporary_allocation="heap",
+        c_stack_temporary_max_bytes=32768,
+        c_allow_vla_temporaries=False,
     ):
         """Initialize the settings.
         Parameters
@@ -200,6 +205,12 @@ class Settings:
         use_c_signature_parser : bool
             If True (default), use the C implementation in ``numeta.signature`` when available.
             If False, force ``numeta.signature`` helpers to use pure Python parsing logic.
+        c_temporary_allocation : str
+            Allocation policy for C-emitter internal temporaries: ``heap``, ``stack``, or ``auto``.
+        c_stack_temporary_max_bytes : int
+            Maximum compile-time-known temporary size for stack allocation when policy is ``auto``.
+        c_allow_vla_temporaries : bool
+            If True, runtime-sized internal C temporaries may be emitted as variable-length arrays.
         """
         self.iso_C = iso_C
 
@@ -222,8 +233,13 @@ class Settings:
         self.set_default_do_checks(default_do_checks)
         self.set_track_source_location(track_source_location)
         self.set_default_compile_flags(default_compile_flags)
+        self.set_default_simd_arch(default_simd_arch)
+        self.set_default_simd_features(default_simd_features)
         self.use_c_dispatch = use_c_dispatch
         self.use_c_signature_parser = use_c_signature_parser
+        self.c_temporary_allocation = c_temporary_allocation
+        self.c_stack_temporary_max_bytes = c_stack_temporary_max_bytes
+        self.c_allow_vla_temporaries = c_allow_vla_temporaries
 
     @staticmethod
     def _normalize_compile_flags(compile_flags):
@@ -346,6 +362,31 @@ class Settings:
         self.__default_compile_flags = normalized
 
     @property
+    def default_simd_arch(self):
+        return self.__default_simd_arch
+
+    def set_default_simd_arch(self, arch: str):
+        if not isinstance(arch, str):
+            raise TypeError("simd_arch must be a string")
+        arch = arch.lower()
+        if arch not in {"scalar", "sse2", "avx", "avx2", "avx512f", "neon", "native"}:
+            raise ValueError(
+                "simd_arch must be one of: scalar, sse2, avx, avx2, avx512f, neon, native"
+            )
+        self.__default_simd_arch = arch
+
+    @property
+    def default_simd_features(self):
+        return self.__default_simd_features
+
+    def set_default_simd_features(self, features):
+        if features is None:
+            features = ()
+        if isinstance(features, str):
+            features = (features,)
+        self.__default_simd_features = tuple(str(feature).lower() for feature in features)
+
+    @property
     def use_c_dispatch(self):
         return self.__use_c_dispatch
 
@@ -364,6 +405,41 @@ class Settings:
         if not isinstance(value, bool):
             raise TypeError("use_c_signature_parser must be a bool")
         self.__use_c_signature_parser = value
+
+    @property
+    def c_temporary_allocation(self):
+        return self.__c_temporary_allocation
+
+    @c_temporary_allocation.setter
+    def c_temporary_allocation(self, value):
+        if not isinstance(value, str):
+            raise TypeError("c_temporary_allocation must be a string")
+        value = value.lower()
+        if value not in {"heap", "stack", "auto"}:
+            raise ValueError("c_temporary_allocation must be 'heap', 'stack', or 'auto'")
+        self.__c_temporary_allocation = value
+
+    @property
+    def c_stack_temporary_max_bytes(self):
+        return self.__c_stack_temporary_max_bytes
+
+    @c_stack_temporary_max_bytes.setter
+    def c_stack_temporary_max_bytes(self, value):
+        if not isinstance(value, int):
+            raise TypeError("c_stack_temporary_max_bytes must be an integer")
+        if value < 0:
+            raise ValueError("c_stack_temporary_max_bytes must be non-negative")
+        self.__c_stack_temporary_max_bytes = value
+
+    @property
+    def c_allow_vla_temporaries(self):
+        return self.__c_allow_vla_temporaries
+
+    @c_allow_vla_temporaries.setter
+    def c_allow_vla_temporaries(self, value):
+        if not isinstance(value, bool):
+            raise TypeError("c_allow_vla_temporaries must be a bool")
+        self.__c_allow_vla_temporaries = value
 
     def _setup_iso_c_defaults(self):
         """Set ISO C default datatypes."""

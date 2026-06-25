@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from numeta.array_shape import SCALAR, UNKNOWN
+from numeta.array_shape import ArrayShape
 from numeta.ast import Variable
 from numeta.settings import settings
 from numeta.exceptions import raise_with_source
@@ -53,6 +53,7 @@ from .nodes import (
     IRPrint,
     IRReturn,
     IRShape,
+    IRSimdStore,
     IRSlice,
     IRType,
     IRUnary,
@@ -63,7 +64,6 @@ from .nodes import (
     IROpaqueExpr,
     IROpaqueStmt,
 )
-
 
 _BINARY_OPS: dict[str, str] = {
     ".eq.": "eq",
@@ -84,14 +84,38 @@ _BINARY_OPS: dict[str, str] = {
 
 def _lower_value_type_from_dtype(dtype, shape) -> IRValueType:
     # Used for C backend to avoid FortranType dependency
+    if getattr(dtype, "_is_vector", False):
+        base_dtype = dtype.base_dtype()
+        base_type = IRType(name=getattr(base_dtype, "_name", str(base_dtype)), kind=None)
+        ir_type = IRType(
+            name=dtype.name,
+            kind=None,
+            bitwidth=dtype.get_nbytes() * 8,
+            is_vector=True,
+            vector_lanes=dtype.lanes(),
+            vector_base=base_type,
+        )
+        return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax))
     ir_type = IRType(name=dtype.name, kind=None)
-    if shape is SCALAR:
-        return IRValueType(dtype=ir_type, shape=None)
-    if shape is UNKNOWN:
-        return IRValueType(dtype=ir_type, shape=IRShape(rank=None, dims=None, order="C"))
-    dims = _lower_shape_dims(shape.as_tuple(), settings.syntax)
+    return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax))
+
+
+def _is_scalar_shape(shape) -> bool:
+    return isinstance(shape, ArrayShape) and shape.is_scalar
+
+
+def _is_unknown_rank_shape(shape) -> bool:
+    return isinstance(shape, ArrayShape) and shape.is_unknown
+
+
+def _lower_ir_shape(shape, syntax_settings) -> IRShape | None:
+    if _is_scalar_shape(shape):
+        return None
+    if _is_unknown_rank_shape(shape):
+        return IRShape(rank=None, dims=None, order="C")
+    dims = _lower_shape_dims(shape.as_tuple(), syntax_settings)
     order = "F" if getattr(shape, "fortran_order", False) else "C"
-    return IRValueType(dtype=ir_type, shape=IRShape(rank=len(dims), dims=dims, order=order))
+    return IRShape(rank=len(dims), dims=dims, order=order)
 
 
 def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedure:
@@ -143,20 +167,10 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                     if lowered_type is None:
                         lowered_type = _lower_type(ftype)
                         ir_type_cache[ftype_id] = lowered_type
-                    if shape is SCALAR:
-                        lowered = IRValueType(dtype=lowered_type, shape=None)
-                    elif shape is UNKNOWN:
-                        lowered = IRValueType(
-                            dtype=lowered_type,
-                            shape=IRShape(rank=None, dims=None, order="C"),
-                        )
-                    else:
-                        dims = _lower_shape_dims(shape.as_tuple(), syntax_settings)
-                        order = "F" if getattr(shape, "fortran_order", False) else "C"
-                        lowered = IRValueType(
-                            dtype=lowered_type,
-                            shape=IRShape(rank=len(dims), dims=dims, order=order),
-                        )
+                    lowered = IRValueType(
+                        dtype=lowered_type,
+                        shape=_lower_ir_shape(shape, syntax_settings),
+                    )
                     vtype_by_ftype_shape[ftype_shape_key] = lowered
             vtype_by_dtype_shape[dtype_shape_key] = lowered
         return lowered
@@ -192,20 +206,10 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                     if lowered_type is None:
                         lowered_type = _lower_type(ftype)
                         ir_type_cache[ftype_id] = lowered_type
-                    if shape is SCALAR:
-                        vtype = IRValueType(dtype=lowered_type, shape=None)
-                    elif shape is UNKNOWN:
-                        vtype = IRValueType(
-                            dtype=lowered_type,
-                            shape=IRShape(rank=None, dims=None, order="C"),
-                        )
-                    else:
-                        dims = _lower_shape_dims(shape.as_tuple(), syntax_settings)
-                        order = "F" if getattr(shape, "fortran_order", False) else "C"
-                        vtype = IRValueType(
-                            dtype=lowered_type,
-                            shape=IRShape(rank=len(dims), dims=dims, order=order),
-                        )
+                    vtype = IRValueType(
+                        dtype=lowered_type,
+                        shape=_lower_ir_shape(shape, syntax_settings),
+                    )
                     vtype_by_ftype_shape[ftype_shape_key] = vtype
             vtype_by_dtype_shape[dtype_shape_key] = vtype
         storage = "value"
@@ -307,11 +311,15 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                     vtype=_get_vtype(expr),
                     source=expr,
                 )
+            metadata = {}
+            if token == "simd_vload":
+                metadata["aligned"] = bool(getattr(expr, "aligned", False))
             return IRIntrinsic(
                 name=token,
                 args=args,
                 vtype=_get_vtype(expr),
                 source=expr,
+                metadata=metadata,
             )
         return IROpaqueExpr(payload=expr, source=expr)
 
@@ -407,6 +415,14 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             )
         if isinstance(stmt, Deallocate):
             return IRDeallocate(var=lower_expr(stmt.array), source=stmt)
+        if stmt.__class__.__name__ == "VStore":
+            return IRSimdStore(
+                array=lower_expr(stmt.array),
+                index=lower_expr(stmt.index),
+                value=lower_expr(stmt.value),
+                aligned=bool(getattr(stmt, "aligned", False)),
+                source=stmt,
+            )
         return IROpaqueStmt(payload=stmt, source=stmt)
 
     args = [lower_var(var, is_arg=True) for var in procedure.arguments.values()]
@@ -442,13 +458,7 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
 
 def _lower_value_type(ftype, shape) -> IRValueType:
     dtype = _lower_type(ftype)
-    if shape is SCALAR:
-        return IRValueType(dtype=dtype, shape=None)
-    if shape is UNKNOWN:
-        return IRValueType(dtype=dtype, shape=IRShape(rank=None, dims=None, order="C"))
-    dims = _lower_shape_dims(shape.as_tuple(), settings.syntax)
-    order = "F" if getattr(shape, "fortran_order", False) else "C"
-    return IRValueType(dtype=dtype, shape=IRShape(rank=len(dims), dims=dims, order=order))
+    return IRValueType(dtype=dtype, shape=_lower_ir_shape(shape, settings.syntax))
 
 
 def _lower_shape_dims(dims, syntax_settings) -> tuple:
@@ -471,10 +481,7 @@ def _lower_type(ftype) -> IRType:
 
 
 def _safe_shape(expr):
-    try:
-        return expr._shape
-    except NotImplementedError:
-        return UNKNOWN
+    return expr._shape
 
 
 def _lower_indices(slice_, syntax_settings) -> list[IRExpr | IRSlice]:

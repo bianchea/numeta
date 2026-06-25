@@ -148,6 +148,110 @@ class DataType(metaclass=DataTypeMeta):
         raise NotImplementedError(f"DataType {cls._name} does not have a defined size")
 
 
+_vector_type_cache = {}
+
+
+def _short_c_name(dtype):
+    if dtype is float64:
+        return "f64"
+    if dtype is float32:
+        return "f32"
+    if dtype is int64:
+        return "i64"
+    if dtype is int32:
+        return "i32"
+    return getattr(dtype, "_name", str(dtype)).replace("int", "i").replace("float", "f")
+
+
+class VectorType(DataType):
+    """Scalar-like logical SIMD vector dtype."""
+
+    _np_type = None
+    _fortran_type = None
+    _fortran_bind_c_type = None
+    _cnp_type = None
+    _name = "vector"
+    _is_vector = True
+
+    @classmethod
+    def __class_getitem__(cls, key):
+        if key is None:
+            return ArrayType(dtype=cls, shape=UNKNOWN)
+        if not isinstance(key, tuple):
+            key = (key,)
+        new_key = []
+        for k in key:
+            if isinstance(k, slice):
+                if k.start is not None or k.stop is not None or k.step is not None:
+                    raise TypeError(f"Invalid type for array dimension: {type(k)}")
+            elif not isinstance(k, int):
+                raise TypeError(f"Invalid type for array dimension: {type(k)}")
+            if isinstance(k, int) and k < 0:
+                raise ValueError("Negative dimensions are not allowed")
+            new_key.append(k if isinstance(k, int) else None)
+        return ArrayType(dtype=cls, shape=ArrayShape(tuple(new_key)))
+
+    @classmethod
+    def get_numpy(cls):
+        return None
+
+    @classmethod
+    def get_fortran(cls, bind_c=None):
+        raise NotImplementedError("VectorType is only supported by the C backend")
+
+    @classmethod
+    def get_nbytes(cls):
+        return cls._base_dtype.get_nbytes() * cls._lanes
+
+    @classmethod
+    def base_dtype(cls):
+        return cls._base_dtype
+
+    @classmethod
+    def lanes(cls):
+        return cls._lanes
+
+
+def make_vector_type(base_dtype, lanes: int):
+    base_dtype = get_datatype(base_dtype)
+    lanes = int(lanes)
+    if lanes <= 0:
+        raise ValueError("Vector lanes must be positive")
+    if base_dtype in {complex64, complex128, complex256, char, bool8, c_ptr}:
+        raise NotImplementedError(
+            "Complex, char, bool, and pointer SIMD vectors are not supported yet"
+        )
+
+    key = (base_dtype, lanes)
+    if key in _vector_type_cache:
+        return _vector_type_cache[key]
+
+    short_name = _short_c_name(base_dtype)
+    name = f"vec_{short_name}_{lanes}"
+    c_name = f"nm_vec_{short_name}_{lanes}"
+    cls = type(
+        name,
+        (VectorType,),
+        {
+            "_name": name,
+            "name": name,
+            "_base_dtype": base_dtype,
+            "_lanes": lanes,
+            "_cnp_type": c_name,
+        },
+    )
+    _vector_type_cache[key] = cls
+    return cls
+
+
+class Vector:
+    def __class_getitem__(cls, key):
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise TypeError("Vector requires Vector[base_dtype, lanes]")
+        base_dtype, lanes = key
+        return make_vector_type(base_dtype, lanes)
+
+
 @dataclass(frozen=True)
 class ArrayType:
     """Helper object returned by DataType[x] to describe array types."""
@@ -168,7 +272,7 @@ class ArrayType:
         )
 
     def __repr__(self):
-        if self.shape is UNKNOWN:
+        if self.shape.is_unknown:
             return f"{self.dtype._name}[*]"
         dims = ",".join(
             ":" if isinstance(d, slice) and d == slice(None) else str(d)
@@ -418,7 +522,7 @@ class StructType(DataType, metaclass=DataTypeMeta):
         members_str = []
         for mname, dt, shape in cls._members:
             dec = f"{dt.get_cnumpy()} {mname}"
-            if shape is not SCALAR and shape is not UNKNOWN:
+            if not shape.is_scalar and not shape.is_unknown:
                 dec += "".join(f"[{d}]" for d in shape.as_tuple())
             members_str.append(dec)
         members_join = "; ".join(members_str)

@@ -1,6 +1,5 @@
 from .expression_node import ExpressionNode
 from numeta.ast.tools import check_node
-from numeta.array_shape import ArrayShape, UNKNOWN, SCALAR
 from numeta.exceptions import NumetaTypeError, raise_with_source
 
 
@@ -17,11 +16,11 @@ class BinaryOperationNode(ExpressionNode):
     @property
     def dtype(self):
         """Return the DataType of the expression."""
-        # This is a simplification. In reality, the type of the result
-        # depends on the types of the operands and the operation.
-        # For example, dividing two integers should result in a real.
-        # For now, we'll just return the type of the left operand.
-        return getattr(self.left, "dtype", None)
+        from numeta.type_rules import binary_result_dtype
+
+        left_dtype = getattr(self.left, "dtype", None)
+        right_dtype = getattr(self.right, "dtype", None)
+        return binary_result_dtype(left_dtype, right_dtype, self.op)
 
     @property
     def _shape(self):
@@ -35,9 +34,9 @@ class BinaryOperationNode(ExpressionNode):
 
         # This is a simplification. It doesn't handle broadcasting correctly.
         # For now, we'll just return the shape of the left operand.
-        if left_shape is SCALAR:
+        if left_shape.is_scalar:
             result_shape = right_shape
-        elif right_shape is SCALAR:
+        elif right_shape.is_scalar:
             result_shape = left_shape
         else:
             result_shape = left_shape

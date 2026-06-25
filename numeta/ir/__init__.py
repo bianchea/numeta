@@ -27,6 +27,7 @@ from .nodes import (
     IRPrint,
     IRAllocate,
     IRDeallocate,
+    IRSimdStore,
     IROpaqueExpr,
     IROpaqueStmt,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "IRPrint",
     "IRAllocate",
     "IRDeallocate",
+    "IRSimdStore",
     "IROpaqueExpr",
     "IROpaqueStmt",
     "lower_procedure",

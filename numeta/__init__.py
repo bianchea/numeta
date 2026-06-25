@@ -13,6 +13,9 @@ from .datatype import (
     char,
     size_t,
     c_ptr,
+    Vector,
+    VectorType,
+    make_vector_type,
     get_datatype,
 )
 from .types_hint import comptime

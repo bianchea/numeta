@@ -1,4 +1,5 @@
 from .various import *
+from .simd_store import VStore
 from .call import Call
 from .variable_declaration import VariableDeclaration
 from .struct_type_declaration import StructTypeDeclaration

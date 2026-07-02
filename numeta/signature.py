@@ -1,4 +1,5 @@
 import inspect
+import os
 import platform
 import sys
 import sysconfig
@@ -9,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from .array_shape import ArrayShape, SCALAR, UNKNOWN
-from .datatype import DataType, ArrayType, get_datatype
+from .datatype import DataType, ArrayType, PointerType, get_datatype
 from .settings import settings
 from .ast import Variable
 from .ast.expressions import ExpressionNode, GetAttr, GetItem
@@ -38,7 +39,8 @@ def _compile_signature_extension(force=False):
 
         # Use standard compiler flags
         std_flags = ["-O3", "-fPIC"]
-        compiler = Compiler("gcc", std_flags)
+        cc = "/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else "gcc"
+        compiler = Compiler(cc, std_flags)
 
         include_dirs = [
             sysconfig.get_paths()["include"],
@@ -131,6 +133,7 @@ def _init_signature_module():
 
     types_dict = {
         "ArrayType": ArrayType,
+        "PointerType": PointerType,
         "DataType": DataType,
         "ExpressionNode": ExpressionNode,
         "Variable": Variable,
@@ -181,6 +184,28 @@ def _resolve_effective_intent(arg):
     return "in"
 
 
+def _is_scalar_shape(shape) -> bool:
+    return isinstance(shape, ArrayShape) and shape.is_scalar
+
+
+def _is_unknown_rank_shape(shape) -> bool:
+    return isinstance(shape, ArrayShape) and shape.is_unknown
+
+
+def _signature_dtype_token(dtype):
+    np_dtype = dtype.get_numpy()
+    return dtype if np_dtype is None else np_dtype
+
+
+def _contains_symbolic_signature_arg(args, kwargs) -> bool:
+    def is_symbolic(arg):
+        if isinstance(arg, (ArrayType, PointerType, ExpressionNode)):
+            return True
+        return isinstance(arg, type) and issubclass(arg, DataType)
+
+    return any(is_symbolic(arg) for arg in args) or any(is_symbolic(arg) for arg in kwargs.values())
+
+
 @dataclass(frozen=True)
 class ArgumentSpec:
     """
@@ -197,6 +222,10 @@ class ArgumentSpec:
     intent: str = "inout"  # can be "in" or "inout"
     to_pass_by_value: bool = False
     is_keyword: bool = False
+    c_const: bool = False
+    c_restrict: bool = False
+    c_volatile: bool = False
+    explicit_pointer: bool = False
 
 
 @dataclass(frozen=True)
@@ -283,54 +312,68 @@ def _get_signature_and_runtime_args_py(
                 )
         elif isinstance(arg, ArrayType):
             to_execute = False
-            if arg.shape is UNKNOWN or (
+            dtype_token = _signature_dtype_token(arg.dtype)
+            if arg.shape.is_unknown or (
                 not settings.add_shape_descriptors and arg.shape.has_comptime_undefined_dims()
             ):
                 # it is a pointer
-                arg_signature = (name, arg.dtype.get_numpy(), None, arg.shape.fortran_order)
+                arg_signature = (name, dtype_token, None, arg.shape.fortran_order)
             elif arg.shape.has_comptime_undefined_dims():
                 arg_signature = (
                     name,
-                    arg.dtype.get_numpy(),
+                    dtype_token,
                     arg.shape.rank,
                     arg.shape.fortran_order,
                 )
             else:
                 arg_signature = (
                     name,
-                    arg.dtype.get_numpy(),
+                    dtype_token,
                     arg.shape.rank,
                     arg.shape.fortran_order,
                     "inout",
                     arg.shape.as_tuple(),
                 )
-        elif isinstance(arg, type) and issubclass(arg, DataType):
+        elif isinstance(arg, PointerType):
             to_execute = False
             arg_signature = (
                 name,
-                arg.get_numpy(),
+                arg,
+            )
+        elif isinstance(arg, type) and issubclass(arg, DataType):
+            to_execute = False
+            dtype_token = _signature_dtype_token(arg)
+            arg_signature = (
+                name,
+                dtype_token,
             )
         elif isinstance(arg, ExpressionNode):
             to_execute = False
             dtype = arg.dtype
             intent = _resolve_effective_intent(arg)
+            dtype_token = _signature_dtype_token(dtype)
 
-            if arg._shape is SCALAR:
-                if intent == "inout":
+            if _is_scalar_shape(arg._shape):
+                if getattr(dtype, "_is_vector", False):
+                    arg_signature = (
+                        name,
+                        dtype_token,
+                    )
+                elif intent == "inout":
                     arg_signature = (name, dtype.get_numpy(), 0, False, intent)
                 else:
                     arg_signature = (
                         name,
-                        dtype.get_numpy(),
+                        dtype_token,
                     )
-            elif arg._shape is UNKNOWN or (
+            elif _is_unknown_rank_shape(arg._shape) or (
                 not settings.add_shape_descriptors and arg._shape.has_comptime_undefined_dims()
             ):
-                arg_signature = (name, dtype.get_numpy(), None, False, intent)
+                arg_signature = (name, dtype_token, None, False, intent)
             elif arg._shape.has_comptime_undefined_dims():
                 arg_signature = (
                     name,
-                    dtype.get_numpy(),
+                    dtype_token,
                     arg._shape.rank,
                     arg._shape.fortran_order,
                     intent,
@@ -339,14 +382,14 @@ def _get_signature_and_runtime_args_py(
                 if not settings.ignore_fixed_shape_in_nested_calls:
                     arg_signature = (
                         name,
-                        dtype.get_numpy(),
+                        dtype_token,
                         arg._shape.rank,
                         arg._shape.fortran_order,
                         intent,
                         arg._shape.as_tuple(),
                     )
                 else:
-                    arg_signature = (name, dtype.get_numpy(), None, False, intent)
+                    arg_signature = (name, dtype_token, None, False, intent)
         else:
             raise ValueError(f"Argument {name} of type {type(arg)} is not supported")
 
@@ -421,6 +464,21 @@ def convert_signature_to_argument_specs(
 
     def convert_arg_to_argument_spec(arg, is_keyword, name=None):
         name = arg[0] if name is None else name
+
+        if len(arg) == 2 and isinstance(arg[1], PointerType):
+            pointer = arg[1]
+            return ArgumentSpec(
+                name,
+                datatype=pointer.dtype,
+                rank=None,
+                shape=UNKNOWN,
+                intent="in" if pointer.const else "inout",
+                is_keyword=is_keyword,
+                c_const=pointer.const,
+                c_restrict=pointer.restrict,
+                c_volatile=pointer.volatile,
+                explicit_pointer=True,
+            )
 
         dtype = get_datatype(arg[1])
         if len(arg) == 2:
@@ -507,20 +565,23 @@ def get_signature_and_runtime_args(
     n_positional_or_default_args,
     catch_var_positional_name,
 ):
-    if _use_c_signature_parser_backend():
+    if _use_c_signature_parser_backend() and not _contains_symbolic_signature_arg(args, kwargs):
         backend = _c_signature_backend
         assert backend is not None
-        return backend.get_signature_and_runtime_args(
-            args,
-            kwargs,
-            params,
-            fixed_param_indices,
-            n_positional_or_default_args,
-            catch_var_positional_name,
-            settings.add_shape_descriptors,
-            settings.ignore_fixed_shape_in_nested_calls,
-            settings.reorder_kwargs,
-        )
+        try:
+            return backend.get_signature_and_runtime_args(
+                args,
+                kwargs,
+                params,
+                fixed_param_indices,
+                n_positional_or_default_args,
+                catch_var_positional_name,
+                settings.add_shape_descriptors,
+                settings.ignore_fixed_shape_in_nested_calls,
+                settings.reorder_kwargs,
+            )
+        except TypeError:
+            pass
 
     return _get_signature_and_runtime_args_py(
         args,
@@ -549,21 +610,24 @@ def fast_dispatch(
       hit=False, to_execute=True  => payload is signature (cache miss, caller must load+call)
       hit=False, to_execute=False => payload is signature (symbolic, caller handles)
     """
-    if _use_c_signature_parser_backend():
+    if _use_c_signature_parser_backend() and not _contains_symbolic_signature_arg(args, kwargs):
         backend = _c_signature_backend
         assert backend is not None
-        return backend.fast_dispatch(
-            args,
-            kwargs,
-            params,
-            fixed_param_indices,
-            n_positional_or_default_args,
-            catch_var_positional_name,
-            settings.add_shape_descriptors,
-            settings.ignore_fixed_shape_in_nested_calls,
-            settings.reorder_kwargs,
-            fast_call_dict,
-        )
+        try:
+            return backend.fast_dispatch(
+                args,
+                kwargs,
+                params,
+                fixed_param_indices,
+                n_positional_or_default_args,
+                catch_var_positional_name,
+                settings.add_shape_descriptors,
+                settings.ignore_fixed_shape_in_nested_calls,
+                settings.reorder_kwargs,
+                fast_call_dict,
+            )
+        except TypeError:
+            pass
 
     # Python fallback
     to_execute, sig, runtime_args = _get_signature_and_runtime_args_py(
@@ -791,7 +855,8 @@ int {func_name}(PyObject *args, PyObject **runtime_args, PyObject **sig, int *na
         np_include = np.get_include()
 
         # Initialize compiler (GCC)
-        compiler = Compiler("gcc", ["-O3"])
+        cc = "/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else "gcc"
+        compiler = Compiler(cc, ["-O3"])
 
         # Compile to shared library
         compiler.compile_to_library(

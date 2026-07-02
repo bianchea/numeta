@@ -36,13 +36,17 @@ class NumetaCompiledFunction(ExternalLibrary):
         backend: str | None = None,
         simd_arch: str | None = None,
         simd_features: Iterable[str] | str | None = None,
+        c_attributes: Iterable[str] | str | None = None,
+        c_linkage: str | None = None,
+        emit_mode: str | None = None,
     ):
         """
         Has to be linked at runtime
         """
         if library_name is None:
             library_name = func_name
-        super().__init__(library_name, to_link=True)
+        super().__init__(func_name, to_link=True)
+        self._library_name = library_name
         self.symbolic_function = symbolic_function
         if path is None:
             path = tempfile.mkdtemp()
@@ -64,6 +68,11 @@ class NumetaCompiledFunction(ExternalLibrary):
         elif isinstance(simd_features, str):
             simd_features = (simd_features,)
         self.simd_features = tuple(str(feature).lower() for feature in simd_features)
+        if isinstance(c_attributes, str):
+            c_attributes = (c_attributes,)
+        self.c_attributes = tuple(c_attributes or ())
+        self.c_linkage = c_linkage
+        self.emit_mode = emit_mode
         self._requires_math = False
         resolved_flags = settings.default_compile_flags if compile_flags is None else compile_flags
         self.compile_flags = Compiler._normalize_flags(resolved_flags)
@@ -72,20 +81,39 @@ class NumetaCompiledFunction(ExternalLibrary):
 
     @property
     def library_name(self):
-        return self.name
+        return getattr(self, "_library_name", self.name)
 
     @library_name.setter
     def library_name(self, value):
-        self.name = value
+        self._library_name = value
 
     def __setstate__(self, state):
-        # Older pickles store the link-library identity as ``name``. Keep that
-        # storage stable while exposing the clearer ``library_name`` property.
-        if "library_name" in state and "name" not in state:
-            state["name"] = state.pop("library_name")
-        else:
-            state.pop("library_name", None)
+        # Older library pickles stored the aggregate link-library name in
+        # ``name`` for every compiled function.  Keep ``name`` unique for
+        # dependency tracking, and store the link target separately.
+        library_name = state.pop("library_name", None)
+        func_name = state.get("func_name")
+        name = state.get("name")
+        if library_name is None:
+            if func_name is not None and name not in (None, func_name):
+                library_name = name
+                state["name"] = func_name
+            else:
+                library_name = name or func_name
+        elif name is None and func_name is not None:
+            state["name"] = func_name
+        state["_library_name"] = library_name
         self.__dict__.update(state)
+        if not hasattr(self, "simd_arch"):
+            self.simd_arch = settings.default_simd_arch
+        if not hasattr(self, "simd_features"):
+            self.simd_features = settings.default_simd_features
+        if not hasattr(self, "c_attributes"):
+            self.c_attributes = ()
+        if not hasattr(self, "c_linkage"):
+            self.c_linkage = None
+        if not hasattr(self, "emit_mode"):
+            self.emit_mode = None
 
     @property
     def obj_files(self):
@@ -162,6 +190,9 @@ class NumetaCompiledFunction(ExternalLibrary):
                 if isinstance(self.symbolic_function, Namespace):
                     c_code, requires_math = emitter.emit_namespace(self.symbolic_function)
                 else:
+                    self.symbolic_function.c_attributes = getattr(self, "c_attributes", ())
+                    self.symbolic_function.c_linkage = getattr(self, "c_linkage", None)
+                    self.symbolic_function.emit_mode = getattr(self, "emit_mode", None)
                     ir_proc = lower_procedure(self.symbolic_function, backend="c")
                     c_code, requires_math = emitter.emit_procedure(ir_proc)
                 c_src.write_text(c_code)
@@ -319,6 +350,10 @@ class NumetaFunction(BaseFunction):
         backend: str | None = None,
         simd_arch: str | None = None,
         simd_features: Iterable[str] | str | None = None,
+        c_name: str | None = None,
+        c_attributes: Iterable[str] | str | None = None,
+        c_linkage: str | None = None,
+        emit_mode: str | None = None,
     ) -> None:
         ExternalLibrary.__init__(self, func.__name__, to_link=True)
         self.name = func.__name__
@@ -342,6 +377,13 @@ class NumetaFunction(BaseFunction):
         elif isinstance(simd_features, str):
             simd_features = (simd_features,)
         self.simd_features = tuple(str(feature).lower() for feature in simd_features)
+        if isinstance(c_attributes, str):
+            c_attributes = (c_attributes,)
+        decorated_attributes = tuple(getattr(func, "_numeta_c_attributes", ()))
+        self.c_name = c_name
+        self.c_attributes = decorated_attributes + tuple(c_attributes or ())
+        self.c_linkage = c_linkage
+        self.emit_mode = emit_mode
 
         self.namer = namer
         self.inline = inline
@@ -389,6 +431,30 @@ class NumetaFunction(BaseFunction):
 
     def get_symbolic_functions(self):
         return [v.symbolic_function for v in self._compiled_functions.values()]
+
+    def clear_generated_state(self, signatures=None, *, release_names: bool = True) -> None:
+        if signatures is None:
+            selected_signatures = set(self._compiled_functions)
+            selected_signatures.update(self.return_signatures)
+            selected_signatures.update(self._wrapper_specs)
+            selected_signatures.update(self._pyc_extensions)
+            selected_signatures.update(self._fast_call)
+        else:
+            selected_signatures = tuple(dict.fromkeys(signatures))
+
+        released_names = []
+        for signature in selected_signatures:
+            compiled = self._compiled_functions.pop(signature, None)
+            if compiled is not None:
+                released_names.append(compiled.func_name)
+            self.return_signatures.pop(signature, None)
+            self._wrapper_specs.pop(signature, None)
+            self._pyc_extensions.pop(signature, None)
+            self._fast_call.pop(signature, None)
+
+        self._library_pyc_extension = None
+        if release_names and released_names:
+            native_name_registry.release_many(released_names)
 
     def run_symbolic(self, *args, **kwargs):
         return self._func(*args, **kwargs)
@@ -488,7 +554,9 @@ class NumetaFunction(BaseFunction):
         for out_ptr, out_array, shape_var, rank in return_pointers:
             shape_fortran = shape_var
             if self.backend == "fortran" and rank != 1:
-                shape_fortran = shape_var[rank - 1 : 1 : -1]
+                from .ast.expressions.various import ArrayConstructor
+
+                shape_fortran = ArrayConstructor(*[shape_var[i] for i in range(rank - 1, -1, -1)])
             from numeta.fortran.external_modules.iso_c_binding import iso_c
 
             iso_c.c_f_pointer(out_ptr, out_array, shape_fortran)
@@ -501,6 +569,18 @@ class NumetaFunction(BaseFunction):
     def __setstate__(self, state):
         """Restore state from pickle."""
         self.__dict__.update(state)
+        if not hasattr(self, "simd_arch"):
+            self.simd_arch = settings.default_simd_arch
+        if not hasattr(self, "simd_features"):
+            self.simd_features = settings.default_simd_features
+        if not hasattr(self, "c_name"):
+            self.c_name = None
+        if not hasattr(self, "c_attributes"):
+            self.c_attributes = ()
+        if not hasattr(self, "c_linkage"):
+            self.c_linkage = None
+        if not hasattr(self, "emit_mode"):
+            self.emit_mode = None
         if not hasattr(self, "_wrapper_specs"):
             self._wrapper_specs = {}
             for signature, compiled in self._compiled_functions.items():
@@ -590,13 +670,25 @@ class NumetaFunction(BaseFunction):
             dtype = arg_spec.datatype
 
             if arg_spec.rank == 0:
-                return Variable(arg_spec.name, dtype=dtype, shape=SCALAR, intent=arg_spec.intent)
-            elif arg_spec.shape is UNKNOWN:
+                return Variable(
+                    arg_spec.name,
+                    dtype=dtype,
+                    shape=SCALAR,
+                    intent=arg_spec.intent,
+                    c_const=arg_spec.c_const,
+                    c_restrict=arg_spec.c_restrict,
+                    c_volatile=arg_spec.c_volatile,
+                    pass_by_value=arg_spec.to_pass_by_value or None,
+                )
+            elif arg_spec.shape.is_unknown:
                 return Variable(
                     arg_spec.name,
                     dtype=dtype,
                     shape=UNKNOWN,
                     intent=arg_spec.intent,
+                    c_const=arg_spec.c_const,
+                    c_restrict=arg_spec.c_restrict,
+                    c_volatile=arg_spec.c_volatile,
                 )
             elif arg_spec.shape.has_comptime_undefined_dims():
                 if settings.add_shape_descriptors:
@@ -625,6 +717,9 @@ class NumetaFunction(BaseFunction):
                     dtype=dtype,
                     shape=shape,
                     intent=arg_spec.intent,
+                    c_const=arg_spec.c_const,
+                    c_restrict=arg_spec.c_restrict,
+                    c_volatile=arg_spec.c_volatile,
                 )
             else:
                 # The dimension is fixed
@@ -633,6 +728,9 @@ class NumetaFunction(BaseFunction):
                     dtype=dtype,
                     shape=arg_spec.shape,
                     intent=arg_spec.intent,
+                    c_const=arg_spec.c_const,
+                    c_restrict=arg_spec.c_restrict,
+                    c_volatile=arg_spec.c_volatile,
                 )
 
         symbolic_args = []
@@ -671,6 +769,12 @@ class NumetaFunction(BaseFunction):
                     f"Compiled function name '{name}' already exists. "
                     "Pass allow_existing_name=True only when intentionally replacing an old specialization."
                 )
+        elif self.c_name is not None:
+            name = self.c_name
+            if native_name_registry.is_reserved(name):
+                raise ValueError(
+                    f"Configured compiled function name '{name}' is already registered."
+                )
         elif self.namer is None:
             suffix = len(native_name_registry.reserved_names)
             name = f"{self.name}_{suffix}"
@@ -705,6 +809,9 @@ class NumetaFunction(BaseFunction):
         native_name_registry.reserve(name)
 
         symbolic_fun = self.get_symbolic_function(name, signature)
+        symbolic_fun.c_attributes = self.c_attributes
+        symbolic_fun.c_linkage = self.c_linkage
+        symbolic_fun.emit_mode = self.emit_mode
 
         self._compiled_functions[signature] = NumetaCompiledFunction(
             name,
@@ -715,6 +822,9 @@ class NumetaFunction(BaseFunction):
             backend=self.backend,
             simd_arch=self.simd_arch,
             simd_features=self.simd_features,
+            c_attributes=self.c_attributes,
+            c_linkage=self.c_linkage,
+            emit_mode=self.emit_mode,
         )
 
         symbolic_fun.parent = self._compiled_functions[signature]

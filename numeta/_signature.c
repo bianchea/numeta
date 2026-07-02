@@ -8,6 +8,7 @@
 
 // Globals for types
 static PyObject *ArrayType = NULL;
+static PyObject *PointerType = NULL;
 static PyObject *DataType = NULL;
 static PyObject *ExpressionNode = NULL;
 static PyObject *Variable = NULL;
@@ -107,6 +108,34 @@ static inline PyObject* sig_from_scalar(PyObject *arg, PyObject *name) {
     return PyTuple_Pack(2, name, type);
 }
 
+static PyObject* signature_dtype_token(PyObject *dtype) {
+    PyObject *numpy_dtype = PyObject_CallMethodObjArgs(dtype, str_get_numpy, NULL);
+    if (!numpy_dtype) {
+        return NULL;
+    }
+    if (numpy_dtype == Py_None) {
+        Py_DECREF(numpy_dtype);
+        PyErr_SetString(PyExc_TypeError, "Numeta dtype has no NumPy signature token");
+        return NULL;
+    }
+    return numpy_dtype;
+}
+
+static int dtype_is_vector(PyObject *dtype) {
+    PyObject *flag = PyObject_GetAttrString(dtype, "_is_vector");
+    if (!flag) {
+        PyErr_Clear();
+        return 0;
+    }
+    int result = PyObject_IsTrue(flag);
+    Py_DECREF(flag);
+    if (result < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    return result;
+}
+
 // ArrayType handler with Python-parity signature construction
 static PyObject* sig_from_arraytype(PyObject *arg, PyObject *name,
                                      int *to_execute, Settings *settings) {
@@ -121,7 +150,7 @@ static PyObject* sig_from_arraytype(PyObject *arg, PyObject *name,
         return NULL;
     }
 
-    PyObject *numpy_dtype = PyObject_CallMethodObjArgs(dtype, str_get_numpy, NULL);
+    PyObject *numpy_dtype = signature_dtype_token(dtype);
     if (!numpy_dtype) {
         Py_DECREF(shape);
         Py_DECREF(dtype);
@@ -284,7 +313,9 @@ static PyObject* sig_from_expression_node(PyObject *arg, PyObject *name,
     PyObject *sig = NULL;
     
     if (shape_is_scalar) {
-        if (intent_str == str_inout) {
+        if (dtype_is_vector(dtype)) {
+            sig = PyTuple_Pack(2, name, numpy_dtype);
+        } else if (intent_str == str_inout) {
             sig = PyTuple_Pack(5, name, numpy_dtype, PyLong_FromLong(0), 
                               Py_False, intent_str);
         } else {
@@ -336,6 +367,12 @@ static PyObject* sig_from_expression_node(PyObject *arg, PyObject *name,
     return sig;
 }
 
+static PyObject* sig_from_pointertype(PyObject *arg, PyObject *name, int *to_execute) {
+    *to_execute = 0;
+    PyErr_SetString(PyExc_TypeError, "PointerType signatures require Python parser fallback");
+    return NULL;
+}
+
 // Main signature extraction - optimized dispatcher
 static PyObject* get_signature_from_arg(PyObject *arg, PyObject *name, 
                                          int *to_execute, Settings *settings) {
@@ -355,6 +392,10 @@ static PyObject* get_signature_from_arg(PyObject *arg, PyObject *name,
     if (is_instance_fast(arg, ArrayType)) {
         return sig_from_arraytype(arg, name, to_execute, settings);
     }
+
+    if (is_instance_fast(arg, PointerType)) {
+        return sig_from_pointertype(arg, name, to_execute);
+    }
     
     if (is_instance_fast(arg, ExpressionNode)) {
         return sig_from_expression_node(arg, name, to_execute, settings);
@@ -363,7 +404,7 @@ static PyObject* get_signature_from_arg(PyObject *arg, PyObject *name,
     // DataType class handling (e.g. nm.float64)
     if (PyType_Check(arg) && PyObject_IsSubclass(arg, DataType)) {
         *to_execute = 0;
-        PyObject *numpy_dtype = PyObject_CallMethodObjArgs(arg, str_get_numpy, NULL);
+        PyObject *numpy_dtype = signature_dtype_token(arg);
         if (!numpy_dtype) return NULL;
         PyObject *sig = PyTuple_Pack(2, name, numpy_dtype);
         Py_DECREF(numpy_dtype);
@@ -889,6 +930,42 @@ static PyObject *BaseFunction_configure_dispatch(BaseFunctionObject *self, PyObj
     Py_RETURN_NONE;
 }
 
+static int should_delegate_symbolic_arg(PyObject *arg) {
+    if (is_instance_fast(arg, ArrayType)) return 1;
+    if (is_instance_fast(arg, PointerType)) return 1;
+    if (is_instance_fast(arg, ExpressionNode)) return 1;
+    if (PyType_Check(arg)) {
+        int is_dtype = PyObject_IsSubclass(arg, DataType);
+        if (is_dtype == 1) return 1;
+        if (is_dtype < 0) PyErr_Clear();
+    }
+    return 0;
+}
+
+static int should_delegate_symbolic_call(PyObject *args, PyObject *kwargs) {
+    Py_ssize_t nargs = PyTuple_GET_SIZE(args);
+    for (Py_ssize_t i = 0; i < nargs; ++i) {
+        if (should_delegate_symbolic_arg(PyTuple_GET_ITEM(args, i))) return 1;
+    }
+    if (kwargs && PyDict_Check(kwargs)) {
+        PyObject *key;
+        PyObject *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(kwargs, &pos, &key, &value)) {
+            if (should_delegate_symbolic_arg(value)) return 1;
+        }
+    }
+    return 0;
+}
+
+static PyObject *call_python_fallback(BaseFunctionObject *self, PyObject *args, PyObject *kwargs) {
+    PyObject *method = PyObject_GetAttrString((PyObject*)self, "_python_call");
+    if (!method) return NULL;
+    PyObject *result = PyObject_Call(method, args, kwargs);
+    Py_DECREF(method);
+    return result;
+}
+
 static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyObject *kwargs) {
     // Check if configured
     if (!self->params || !self->fast_call_dict) {
@@ -898,12 +975,7 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
 
     // Check if C dispatch is disabled via settings (fallback to Python implementation)
     if (!self->settings.use_c_dispatch) {
-        PyObject *method = PyObject_GetAttrString((PyObject*)self, "_python_call");
-        if (!method) return NULL;
-        PyObject *result = PyObject_Call(method, args, kwargs);
-        
-        Py_DECREF(method);
-        return result;
+        return call_python_fallback(self, args, kwargs);
     }
     
     // Default kwargs to empty dict if NULL (call from python with no kwargs)
@@ -912,6 +984,12 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
         tmp_kwargs = PyDict_New();
         if (!tmp_kwargs) return NULL;
         kwargs = tmp_kwargs;
+    }
+
+    if (should_delegate_symbolic_call(args, kwargs)) {
+        PyObject *result = call_python_fallback(self, args, kwargs);
+        Py_XDECREF(tmp_kwargs);
+        return result;
     }
 
     ParseInput input = {
@@ -1011,7 +1089,14 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
     // --- Slow Path: Generic Parser ---
     if (_parse_signature_core(&input, &result, stack_buf, MAX_STACK_ARGS) < 0) {
         Py_XDECREF(tmp_kwargs);
-        return NULL;
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+        }
+        PyObject *method = PyObject_GetAttrString((PyObject*)self, "_python_call");
+        if (!method) return NULL;
+        ret_val = PyObject_Call(method, args, kwargs);
+        Py_DECREF(method);
+        return ret_val;
     }
 
     // Clean up temporary kwargs if we created it
@@ -1019,20 +1104,13 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
 
     // --- Not executable (symbolic) OR Forced Symbolic ---
     if (!result.to_execute || force_symbolic) {
-        // Symbolic execution required
-        PyObject *runtime_args_list = _runtime_args_to_list(result.runtime_args_buf, result.nruntime);
         _parse_result_cleanup(&result);
-        if (!runtime_args_list) {
-            Py_DECREF(result.sig_tuple);
-            return NULL;
-        }
-        
-        // Callback: self._handle_symbolic_call(signature, runtime_args)
-        ret_val = PyObject_CallMethod((PyObject*)self, "_handle_symbolic_call", "OO", 
-                                      result.sig_tuple, runtime_args_list);
-        
         Py_DECREF(result.sig_tuple);
-        Py_DECREF(runtime_args_list);
+
+        PyObject *method = PyObject_GetAttrString((PyObject*)self, "_python_call");
+        if (!method) return NULL;
+        ret_val = PyObject_Call(method, args, kwargs);
+        Py_DECREF(method);
         return ret_val;
     }
 
@@ -1137,6 +1215,7 @@ static PyObject *init_globals(PyObject *self, PyObject *args) {
         Py_XINCREF(name);
 
     LOAD_TYPE(ArrayType);
+    LOAD_TYPE(PointerType);
     LOAD_TYPE(DataType);
     LOAD_TYPE(ExpressionNode);
     LOAD_TYPE(Variable);

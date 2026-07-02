@@ -15,6 +15,8 @@ from .datatype import (
     c_ptr,
     Vector,
     VectorType,
+    PointerType,
+    ptr,
     make_vector_type,
     get_datatype,
 )
@@ -47,7 +49,8 @@ b1 = bool8
 
 from .fortran.external_modules import iso_c, omp
 
-from .jit import jit
+from .jit import c_function_attributes, jit
+from .c.emitter import CTranslationUnit
 from .numeta_library import NumetaLibrary
 from .wrappers import *
 from .ast import *

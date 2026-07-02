@@ -102,11 +102,21 @@ def helper_name(op: str, vector_dtype) -> str:
     raise NotImplementedError(f"Unsupported SIMD helper op: {op}")
 
 
-def render_typedefs(vector_dtypes, target: SimdTarget) -> list[str]:
+def render_typedefs(
+    vector_dtypes,
+    target: SimdTarget,
+    *,
+    vector_type_style: str = "intrinsic",
+) -> list[str]:
     lines: list[str] = []
     for vector_dtype in sorted(vector_dtypes, key=lambda dtype: dtype.get_cnumpy()):
         abi = vector_abi(vector_dtype, target)
-        if abi.is_scalar_fallback:
+        if vector_type_style == "gcc_vector" and not abi.is_scalar_fallback:
+            bytes_ = vector_dtype.get_nbytes()
+            lines.append(
+                f"typedef {abi.base_ctype} {abi.c_name} __attribute__((vector_size({bytes_})));\n"
+            )
+        elif abi.is_scalar_fallback:
             lines.append(
                 f"typedef struct {{ {abi.base_ctype} lane[{abi.lanes}]; }} {abi.c_name};\n"
             )

@@ -452,6 +452,9 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             "fortran_pure": procedure.pure,
             "fortran_elemental": procedure.elemental,
             "fortran_bind_c": procedure.bind_c,
+            "c_attributes": tuple(getattr(procedure, "c_attributes", ())),
+            "c_linkage": getattr(procedure, "c_linkage", None),
+            "emit_mode": getattr(procedure, "emit_mode", None),
         },
     )
 

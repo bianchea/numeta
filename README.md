@@ -23,6 +23,9 @@ More rationale is in [Why Fortran Backend](#why-fortran-backend).
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+  - [Defaults](#defaults)
+  - [Backends](#backends)
+  - [C Backend Shared-Kernel ABI](#c-backend-shared-kernel-abi)
   - [Type Hints](#type-hints)
   - [Parallelizing Loops](#parallelizing-loops)
   - [Cache Compiled Code](#cache-compiled-code)
@@ -149,6 +152,131 @@ Or set a global default:
 ```python
 nm.settings.set_default_backend("c")
 ```
+
+### C Backend Shared-Kernel ABI
+
+The C backend has a lower-level code generation path for reusable helper kernels.
+It is intended for generated code that needs stable C signatures, direct helper
+calls, SIMD vector values at function boundaries, and explicit pointer qualifiers.
+These APIs are most useful when Numeta is being used as a C code generator rather
+than as a normal Python-callable JIT wrapper.
+
+Use `nm.Vector[dtype, lanes]` when a helper should receive a SIMD value directly,
+without storing lanes to a temporary array in the caller and reloading them in the
+callee:
+
+```python
+import numeta as nm
+
+v4 = nm.Vector[nm.f8, 4]
+
+@nm.jit(
+    backend="c",
+    simd_arch="avx2",
+    simd_features=("fma",),
+    name="build_R_L8",
+    c_attributes=["hot", "aligned(64)", 'visibility("hidden")'],
+)
+def build_R_L8(workspace, outer_p, outer_px, prefactor):
+    scale = nm.broadcast(prefactor, lanes=4)
+    value = nm.fma(outer_p, scale, outer_px)
+    nm.vstore(workspace, 0, value)
+
+build_R_L8(
+    nm.ptr(nm.f8, restrict=True),
+    v4,
+    v4,
+    nm.f8,
+)
+```
+
+The C signature uses vector parameters by value:
+
+```c
+__attribute__((hot, aligned(64), visibility("hidden")))
+void build_R_L8(npy_float64 * restrict workspace,
+                nm_vec_f64_4 outer_p,
+                nm_vec_f64_4 outer_px,
+                npy_float64 prefactor);
+```
+
+Use `nm.ptr(...)` for raw C pointer arguments. Qualifiers are emitted in the C
+signature:
+
+```python
+@nm.jit(backend="c")
+def kernel(workspace, bra_batch_buffer, E):
+    workspace[0] = bra_batch_buffer[0] + E[0]
+
+kernel(
+    nm.ptr(nm.f8, restrict=True),
+    nm.ptr(nm.f8, const=True, restrict=True),
+    nm.ptr(nm.f8, const=True, restrict=True),
+)
+```
+
+This emits arguments such as:
+
+```c
+npy_float64 * restrict workspace,
+const npy_float64 * restrict bra_batch_buffer,
+const npy_float64 * restrict E
+```
+
+Wrappers can call declared C helpers with `nm.external_function(...)`. This keeps
+the call as a normal C call and preserves vector arguments:
+
+```python
+build_R = nm.external_function(
+    "build_R_L8",
+    [
+        nm.ptr(nm.f8, restrict=True),
+        nm.Arg(v4, pass_by_value=True),
+        nm.Arg(v4, pass_by_value=True),
+        nm.Arg(nm.f8, pass_by_value=True),
+    ],
+    None,
+)
+
+@nm.jit(backend="c", simd_arch="avx2", simd_features=("fma",))
+def wrapper(workspace, lanes):
+    outer_p = nm.vload(lanes, 0, lanes=4)
+    outer_px = nm.vload(lanes, 4, lanes=4)
+    build_R(workspace, outer_p, outer_px, 1.0)
+
+wrapper(nm.ptr(nm.f8, restrict=True), nm.ptr(nm.f8, const=True))
+```
+
+For same-translation-unit emission, add the helper and its wrappers in the order
+you want them emitted:
+
+```python
+from numeta.c.emitter import CEmitter
+
+emitter = CEmitter(simd_arch="avx2", simd_features=("fma",))
+unit = emitter.create_translation_unit("tttcc_l4v2_P4_Q4_L8.c")
+
+unit.add_function(build_R_L8, linkage="static")
+unit.add_function(eval_2222)
+unit.add_function(eval_1322)
+
+source = unit.emit()
+header = unit.emit_header(guard="TTTCC_L4V2_P4_Q4_L8_H")
+```
+
+Each jitted function added to a `CTranslationUnit` should have exactly one
+compiled signature. If a function has several specializations, add the specific
+compiled procedure's `symbolic_function` instead.
+
+`emit_mode="static_inline"` emits a helper as `static inline`, and
+`c_attributes=[...]` accepts raw GCC/Clang attribute fragments such as
+`"always_inline"`, `"noinline"`, `"section(\".text.hot.phasedint\")"`, or
+`'visibility("hidden")'`.
+
+Vector arguments are code-generation signatures, not Python runtime SIMD objects.
+Call the function with Numeta type descriptors such as `nm.Vector[nm.f8, 4]` and
+`nm.ptr(nm.f8)` to build or emit the specialization; use regular NumPy arrays and
+scalars for normal Python-callable JIT execution.
 
 ### Type Hints
 

@@ -5,7 +5,7 @@ from typing import Any, Sequence
 from numeta.ast import Variable, ExternalNamespace
 from numeta.fortran.fortran_type import FortranType
 from numeta.external_library import ExternalLibrary
-from numeta.datatype import DataType, ArrayType
+from numeta.datatype import DataType, ArrayType, PointerType
 from numeta.array_shape import SCALAR
 
 
@@ -36,7 +36,7 @@ class ExternalLibraryWrapper(ExternalLibrary):
     def add_method(
         self,
         name: str,
-        argtypes: Sequence[Arg | DataType | ArrayType | FortranType | type],
+        argtypes: Sequence[Arg | DataType | ArrayType | PointerType | FortranType | type],
         restype: DataType | ArrayType | FortranType | type | None,
         bind_c: bool = True,
     ) -> None:
@@ -49,6 +49,9 @@ class ExternalLibraryWrapper(ExternalLibrary):
                         arg.hint,
                         bind_c=bind_c,
                         pass_by_value=arg.pass_by_value,
+                        c_const=arg.c_const,
+                        c_restrict=arg.c_restrict,
+                        c_volatile=arg.c_volatile,
                     )
                 )
             else:
@@ -75,11 +78,20 @@ class ExternalLibraryWrapper(ExternalLibrary):
 
 def convert_argument(
     name: str,
-    hint: DataType | ArrayType | FortranType | type,
+    hint: DataType | ArrayType | PointerType | FortranType | type,
     bind_c: bool = True,
     pass_by_value: bool | None = None,
+    c_const: bool = False,
+    c_restrict: bool = False,
+    c_volatile: bool = False,
 ) -> Variable:
-    if isinstance(hint, ArrayType):
+    if isinstance(hint, PointerType):
+        dtype = hint.dtype
+        shape = SCALAR if pass_by_value else None
+        c_const = hint.const
+        c_restrict = hint.restrict
+        c_volatile = hint.volatile
+    elif isinstance(hint, ArrayType):
         dtype = hint.dtype
         shape = hint.shape
     elif isinstance(hint, FortranType):
@@ -98,12 +110,39 @@ def convert_argument(
         name,
         dtype=dtype,
         use_c_types=bind_c,
-        shape=shape,
+        shape=shape if shape is not None else None,
         pass_by_value=pass_by_value,
+        c_const=c_const,
+        c_restrict=c_restrict,
+        c_volatile=c_volatile,
     )
 
 
 @dataclass(frozen=True)
 class Arg:
-    hint: DataType | ArrayType | FortranType | type
+    hint: DataType | ArrayType | PointerType | FortranType | type
     pass_by_value: bool | None = None
+    c_const: bool = False
+    c_restrict: bool = False
+    c_volatile: bool = False
+
+
+def external_function(
+    name: str,
+    args: Sequence[Arg | DataType | ArrayType | PointerType | FortranType | type],
+    returns: DataType | ArrayType | FortranType | type | None = None,
+    *,
+    bind_c: bool = True,
+    c_attributes: Sequence[str] | str | None = None,
+    c_linkage: str | None = None,
+    emit_mode: str | None = None,
+):
+    lib = ExternalLibraryWrapper(f"{name}_external", to_link=False)
+    lib.add_method(name, args, returns, bind_c=bind_c)
+    proc = lib.methods.procedures[name]
+    if isinstance(c_attributes, str):
+        c_attributes = (c_attributes,)
+    proc.c_attributes = tuple(c_attributes or ())
+    proc.c_linkage = c_linkage
+    proc.emit_mode = emit_mode
+    return proc

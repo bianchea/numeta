@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shlex
 import subprocess as sp
 import textwrap
@@ -11,6 +12,8 @@ from .exceptions import CompilationError
 
 class Compiler:
     def __init__(self, compiler, compile_flags: str | Iterable[str]) -> None:
+        if compiler == "gcc" and os.path.exists("/usr/bin/gcc"):
+            compiler = "/usr/bin/gcc"
         self.compiler = compiler
         self.compile_flags = self._normalize_flags(compile_flags)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, NoReturn, cast
+from typing import Any, Iterable, NoReturn, cast
 
 import numpy as np
 
@@ -128,6 +128,19 @@ class CProcedureSignature:
         return True
 
 
+@dataclass(frozen=True)
+class CFunctionConfig:
+    linkage: str = "external"
+    attributes: tuple[str, ...] = ()
+    emit_mode: str = "external"
+
+
+@dataclass(frozen=True)
+class CTranslationUnitEntry:
+    proc: IRProcedure
+    config: CFunctionConfig
+
+
 def _is_shape_descriptor_expr(expr: IRExpr, base: str | None = None) -> bool:
     if isinstance(expr, IRIntrinsic) and expr.name == "array_constructor":
         return True
@@ -140,7 +153,13 @@ def _is_shape_descriptor_expr(expr: IRExpr, base: str | None = None) -> bool:
 
 
 class CEmitter:
-    def __init__(self, *, simd_arch: str | None = None, simd_features=()) -> None:
+    def __init__(
+        self,
+        *,
+        simd_arch: str | None = None,
+        simd_features=(),
+        vector_type_style: str = "intrinsic",
+    ) -> None:
         self._array_info: dict[str, dict[str, Any]] = {}
         self._shape_arg_map: dict[str, str] = {}
         self._symbols: dict[str, CSymbolInfo] = {}
@@ -152,12 +171,28 @@ class CEmitter:
         if simd_features is None:
             simd_features = nm_settings.default_simd_features
         self._simd_target = make_simd_target(simd_arch, features=simd_features)
+        if vector_type_style not in {"intrinsic", "gcc_vector"}:
+            raise ValueError("vector_type_style must be 'intrinsic' or 'gcc_vector'")
+        self.vector_type_style = vector_type_style
         self._vector_types: set[type[DataType]] = set()
         self._simd_helpers_needed: set[tuple[str, type[DataType]]] = set()
 
     @property
     def requires_math(self) -> bool:
         return self._requires_math
+
+    def _reset_procedure_state(self) -> None:
+        self._array_info = {}
+        self._shape_arg_map = {}
+        self._symbols = {}
+        self._tmp_counter = 0
+
+    def _reset_translation_state(self) -> None:
+        self._reset_procedure_state()
+        self._requires_math = False
+        self._reduction_helpers = {}
+        self._vector_types = set()
+        self._simd_helpers_needed = set()
 
     def _resolve_source_node(self, origin: object | None) -> object | None:
         if origin is None:
@@ -189,35 +224,171 @@ class CEmitter:
         return getattr(shape, "dims", None)
 
     def emit_procedure(self, proc: IRProcedure) -> tuple[str, bool]:
-        self._array_info = {}
-        self._shape_arg_map = {}
-        self._symbols = {}
-        self._tmp_counter = 0
-        self._requires_math = False
-        self._reduction_helpers = {}
-        self._vector_types = set()
-        self._simd_helpers_needed = set()
+        self._reset_translation_state()
+        rendered = self._render_procedure_definition(proc)
+        lines = self._render_c_file(
+            struct_defs=rendered["struct_defs"],
+            global_constants=rendered["global_constants"],
+            prototypes=rendered["prototypes"],
+            definitions=rendered["definition"],
+        )
+        return "".join(lines), self._requires_math
 
-        for arg in proc.args:
-            if arg.name.startswith("shape_"):
-                base = arg.name[len("shape_") :]
-                if base:
-                    self._shape_arg_map[arg.name] = base
-                    self._symbols[arg.name] = CSymbolInfo(name=arg.name, shape_base=base)
+    def create_translation_unit(self, name: str | None = None) -> "CTranslationUnit":
+        unit = CTranslationUnit(self)
+        unit.name = name
+        return unit
 
-        arg_specs = self._build_signature(proc)
-        self._collect_simd_requirements(proc)
+    def emit_source(
+        self,
+        functions: Iterable[Any],
+        *,
+        include_header: bool | str = False,
+        header_name: str | None = None,
+    ) -> tuple[str, bool]:
+        self._reset_translation_state()
+        entries = [self._coerce_translation_unit_entry(function) for function in functions]
+        struct_defs: list[str] = []
+        global_constants: list[str] = []
+        prototypes: list[str] = []
+        definitions: list[str] = []
+        seen_sections: set[str] = set()
 
-        struct_defs = self._collect_struct_defs(proc)
-        global_constants = self._collect_global_constants(proc)
-        prototypes = self._render_prototypes(proc)
+        unit_names = {entry.proc.name for entry in entries}
+        for entry in entries:
+            rendered = self._render_procedure_definition(entry.proc, config=entry.config)
+            for key, target in (
+                ("struct_defs", struct_defs),
+                ("global_constants", global_constants),
+            ):
+                for line in cast(list[str], rendered[key]):
+                    if line not in seen_sections:
+                        seen_sections.add(line)
+                        target.append(line)
+            prototype = cast(str, rendered["prototype"])
+            if prototype not in seen_sections:
+                seen_sections.add(prototype)
+                prototypes.append(prototype)
+            for prototype_line in cast(list[str], rendered["prototypes"]):
+                if any(f" {name}(" in prototype_line for name in unit_names):
+                    continue
+                if prototype_line not in seen_sections:
+                    seen_sections.add(prototype_line)
+                    prototypes.append(prototype_line)
+            definitions.extend(cast(list[str], rendered["definition"]))
+            if definitions and definitions[-1] != "\n":
+                definitions.append("\n")
 
-        body_lines = []
-        body_lines.extend(self._render_local_declarations(proc, indent=1))
-        body_lines.extend(self._render_statements(proc.body, indent=1))
+        include = header_name
+        if include_header and include is None:
+            include = include_header if isinstance(include_header, str) else "numeta_unit.h"
+        lines = self._render_c_file(
+            struct_defs=struct_defs,
+            global_constants=global_constants,
+            prototypes=prototypes,
+            definitions=definitions,
+            include_header=include,
+        )
+        return "".join(lines), self._requires_math
 
+    def emit_header(
+        self,
+        functions: Iterable[Any],
+        *,
+        guard: str | None = None,
+    ) -> str:
+        self._reset_translation_state()
+        entries = [self._coerce_translation_unit_entry(function) for function in functions]
+        struct_defs: list[str] = []
+        prototypes: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            self._prepare_procedure_context(entry.proc)
+            arg_specs = self._build_signature(entry.proc)
+            self._collect_simd_requirements(entry.proc)
+            for line in self._collect_struct_defs(entry.proc):
+                if line not in seen:
+                    seen.add(line)
+                    struct_defs.append(line)
+            prototype = (
+                self._render_function_declaration(
+                    entry.proc,
+                    arg_specs,
+                    config=entry.config,
+                    prototype=True,
+                )
+                + "\n"
+            )
+            if prototype not in seen:
+                seen.add(prototype)
+                prototypes.append(prototype)
+
+        if guard is None:
+            names = "_".join(entry.proc.name.upper() for entry in entries) or "NUMETA_C"
+            guard = re.sub(r"[^A-Z0-9_]", "_", f"{names}_H")
+
+        simd_typedefs = render_simd_typedefs(
+            self._vector_types,
+            self._simd_target,
+            vector_type_style=self.vector_type_style,
+        )
+        lines = [
+            f"#ifndef {guard}\n",
+            f"#define {guard}\n",
+            "\n",
+            "#include <Python.h>\n",
+            "#include <numpy/arrayobject.h>\n",
+        ]
+        simd_header = simd_needs_header(self._vector_types, self._simd_target)
+        if simd_header is not None:
+            lines.append(f"#include <{simd_header}>\n")
+        lines.append("\n")
+        for section in (struct_defs, simd_typedefs, prototypes):
+            if section:
+                lines.extend(section)
+                lines.append("\n")
+        lines.append(f"#endif /* {guard} */\n")
+        return "".join(lines)
+
+    def _coerce_translation_unit_entry(self, function: Any) -> CTranslationUnitEntry:
+        if isinstance(function, CTranslationUnitEntry):
+            return function
+        proc = self._coerce_procedure(function)
+        return CTranslationUnitEntry(proc=proc, config=self._config_from_proc(proc))
+
+    def _coerce_procedure(self, function: Any) -> IRProcedure:
+        if isinstance(function, IRProcedure):
+            return function
+        symbolic = getattr(function, "symbolic_function", None)
+        if symbolic is not None:
+            function = symbolic
+        elif hasattr(function, "_compiled_functions"):
+            compiled = list(function._compiled_functions.values())
+            if len(compiled) != 1:
+                raise ValueError("NumetaFunction emission requires exactly one compiled signature")
+            function = compiled[0].symbolic_function
+
+        if function.__class__.__name__ == "Procedure":
+            from numeta.ir import lower_procedure
+
+            return lower_procedure(function, backend="c")
+        raise TypeError(f"Cannot emit C for object of type {type(function).__name__}")
+
+    def _render_c_file(
+        self,
+        *,
+        struct_defs: Iterable[str],
+        global_constants: Iterable[str],
+        prototypes: Iterable[str],
+        definitions: Iterable[str] | str,
+        include_header: str | None = None,
+    ) -> list[str]:
         reduction_helpers = self._collect_reduction_helpers()
-        simd_typedefs = render_simd_typedefs(self._vector_types, self._simd_target)
+        simd_typedefs = render_simd_typedefs(
+            self._vector_types,
+            self._simd_target,
+            vector_type_style=self.vector_type_style,
+        )
         simd_helpers = render_simd_helpers(
             self._vector_types,
             self._simd_helpers_needed,
@@ -237,37 +408,144 @@ class CEmitter:
             lines.append(f"#include <{simd_header}>\n")
         if self._requires_math:
             lines.append("#include <math.h>\n")
+        if include_header is not None:
+            lines.append(f'#include "{include_header}"\n')
         lines.append("\n")
 
-        if struct_defs:
-            lines.extend(struct_defs)
-            lines.append("\n")
+        for section in (
+            list(struct_defs),
+            simd_typedefs,
+            simd_helpers,
+            reduction_helpers,
+            list(global_constants),
+            list(prototypes),
+        ):
+            if section:
+                lines.extend(section)
+                lines.append("\n")
 
-        if simd_typedefs:
-            lines.extend(simd_typedefs)
-            lines.append("\n")
+        if isinstance(definitions, str):
+            lines.append(definitions)
+        else:
+            lines.extend(definitions)
+        return lines
 
-        if simd_helpers:
-            lines.extend(simd_helpers)
-            lines.append("\n")
+    def _prepare_procedure_context(self, proc: IRProcedure) -> None:
+        self._reset_procedure_state()
+        for arg in proc.args:
+            if arg.name.startswith("shape_"):
+                base = arg.name[len("shape_") :]
+                if base:
+                    self._shape_arg_map[arg.name] = base
+                    self._symbols[arg.name] = CSymbolInfo(name=arg.name, shape_base=base)
 
-        if reduction_helpers:
-            lines.extend(reduction_helpers)
-            lines.append("\n")
+    def _render_procedure_definition(
+        self,
+        proc: IRProcedure,
+        config: CFunctionConfig | None = None,
+    ) -> dict[str, list[str] | str]:
+        self._prepare_procedure_context(proc)
+        arg_specs = self._build_signature(proc)
+        self._collect_simd_requirements(proc)
 
-        if global_constants:
-            lines.extend(global_constants)
-            lines.append("\n")
+        struct_defs = self._collect_struct_defs(proc)
+        global_constants = self._collect_global_constants(proc)
+        prototypes = self._render_prototypes(proc)
 
-        if prototypes:
-            lines.extend(prototypes)
-            lines.append("\n")
+        body_lines = []
+        body_lines.extend(self._render_local_declarations(proc, indent=1))
+        body_lines.extend(self._render_statements(proc.body, indent=1))
 
-        args = ", ".join(arg_specs)
-        lines.append(f"void {proc.name}({args}) {{\n")
-        lines.extend(body_lines)
-        lines.append("}\n")
-        return "".join(lines), self._requires_math
+        declaration = self._render_function_declaration(proc, arg_specs, config=config)
+        prototype = self._render_function_declaration(
+            proc,
+            arg_specs,
+            config=config,
+            prototype=True,
+        )
+        definition = [f"{declaration} {{\n", *body_lines, "}\n"]
+        return {
+            "struct_defs": struct_defs,
+            "global_constants": global_constants,
+            "prototypes": prototypes,
+            "prototype": prototype + "\n",
+            "definition": definition,
+        }
+
+    @staticmethod
+    def _normalize_attributes(attributes: Iterable[str] | str | None) -> tuple[str, ...]:
+        if attributes is None:
+            return ()
+        if isinstance(attributes, str):
+            attributes = (attributes,)
+        return tuple(str(attribute) for attribute in attributes if str(attribute))
+
+    def _config_from_proc(
+        self,
+        proc: IRProcedure,
+        *,
+        linkage: str | None = None,
+        attributes: Iterable[str] | str | None = None,
+        emit_mode: str | None = None,
+    ) -> CFunctionConfig:
+        metadata = proc.metadata or {}
+        source = proc.source
+        base_attrs = self._normalize_attributes(
+            getattr(source, "c_attributes", metadata.get("c_attributes", ()))
+        )
+        extra_attrs = self._normalize_attributes(attributes)
+        selected_linkage = (
+            linkage or getattr(source, "c_linkage", metadata.get("c_linkage", None)) or "external"
+        )
+        selected_mode = (
+            emit_mode
+            or getattr(source, "emit_mode", metadata.get("emit_mode", None))
+            or selected_linkage
+            or "external"
+        )
+        selected_linkage = str(selected_linkage).lower()
+        selected_mode = str(selected_mode).lower()
+
+        attrs = base_attrs + extra_attrs
+        if selected_mode == "hidden" and not any("visibility(" in attr for attr in attrs):
+            attrs = (f'visibility("hidden")',) + attrs
+        if selected_mode in {"static", "static_inline"}:
+            selected_linkage = "static"
+        if selected_linkage == "hidden":
+            selected_linkage = "external"
+            if not any("visibility(" in attr for attr in attrs):
+                attrs = (f'visibility("hidden")',) + attrs
+
+        if selected_linkage not in {"external", "static"}:
+            raise ValueError(f"Unsupported C linkage: {selected_linkage}")
+
+        return CFunctionConfig(
+            linkage=selected_linkage,
+            attributes=attrs,
+            emit_mode=selected_mode,
+        )
+
+    def _render_function_declaration(
+        self,
+        proc: IRProcedure,
+        arg_specs: list[str],
+        *,
+        config: CFunctionConfig | None = None,
+        prototype: bool = False,
+    ) -> str:
+        if config is None:
+            config = self._config_from_proc(proc)
+        specs: list[str] = []
+        if config.linkage == "static":
+            specs.append("static")
+        if config.emit_mode == "static_inline":
+            specs.append("inline")
+        if config.attributes:
+            specs.append(f"__attribute__(({', '.join(config.attributes)}))")
+        specs.append("void")
+        args = ", ".join(arg_specs) if arg_specs else "void"
+        suffix = ";" if prototype else ""
+        return f"{' '.join(specs)} {proc.name}({args}){suffix}"
 
     def _collect_struct_defs(self, proc: IRProcedure) -> list[str]:
         defs: dict[str, str] = {}
@@ -637,9 +915,136 @@ class CEmitter:
         return lines
 
     def _render_prototypes(self, proc: IRProcedure) -> list[str]:
+        callee_sources = self._collect_callee_sources(proc.body)
+        lines: list[str] = []
+        for name, source in sorted(callee_sources.items()):
+            if name == proc.name:
+                continue
+            prototype = self._render_prototype_from_source(name, source)
+            if prototype is None:
+                prototype = f"void {name}(...);\n"
+            lines.append(prototype)
         names = self._collect_callees(proc.body)
+        names -= set(callee_sources)
         names.discard(proc.name)
-        return [f"void {name}(...);\n" for name in sorted(names)]
+        lines.extend(f"void {name}(...);\n" for name in sorted(names))
+        return lines
+
+    def _render_prototype_from_source(self, name: str, source: Any) -> str | None:
+        arguments = getattr(source, "arguments", None)
+        if isinstance(arguments, dict):
+            variables = list(arguments.values())
+        elif isinstance(arguments, (list, tuple)):
+            variables = list(arguments)
+        else:
+            return None
+
+        arg_specs: list[str] = []
+        for variable in variables:
+            variable_name = getattr(variable, "name", "")
+            if variable_name.startswith("shape_"):
+                base = variable_name[len("shape_") :]
+                if base:
+                    arg_specs.append(f"npy_intp* {base}_dims")
+                continue
+            dtype = getattr(variable, "dtype", None)
+            shape = getattr(variable, "_shape", None)
+            if dtype is None:
+                return None
+            ctype = dtype.get_cnumpy()
+            if shape is not None and getattr(shape, "is_scalar", False):
+                pass_by_value = (
+                    getattr(variable, "pass_by_value", False)
+                    or getattr(variable, "intent", None) == "in"
+                    and dtype.can_be_value()
+                )
+                if pass_by_value:
+                    arg_specs.append(f"{ctype} {variable.name}")
+                else:
+                    ir_var = IRVar(name=variable.name, source=variable)
+                    arg_specs.append(self._render_pointer_param(ctype, variable.name, ir_var))
+                continue
+            ir_var = IRVar(
+                name=variable.name,
+                source=variable,
+                intent=getattr(variable, "intent", None),
+            )
+            arg_specs.append(self._render_pointer_param(ctype, variable.name, ir_var))
+
+        source_proc = IRProcedure(name=name, args=[], metadata={}, source=source)
+        config = self._config_from_proc(source_proc)
+        return (
+            self._render_function_declaration(
+                source_proc,
+                arg_specs,
+                config=config,
+                prototype=True,
+            )
+            + "\n"
+        )
+
+    def _collect_callee_sources(self, statements: list[Any]) -> dict[str, Any]:
+        sources: dict[str, Any] = {}
+
+        def visit_stmt(stmt: Any):
+            if isinstance(stmt, IRCall):
+                if isinstance(stmt.func, IRVarRef) and stmt.func.var is not None:
+                    name = self._call_name(stmt.func)
+                    source = stmt.func.var.source
+                    if source is not None:
+                        sources.setdefault(name, source)
+                for arg in stmt.args:
+                    visit_expr(arg)
+            elif isinstance(stmt, IRIf):
+                visit_expr(stmt.cond)
+                for child in stmt.then:
+                    visit_stmt(child)
+                for child in stmt.else_:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRFor):
+                visit_expr(stmt.start)
+                visit_expr(stmt.stop)
+                visit_expr(stmt.step)
+                for child in stmt.body:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRWhile):
+                visit_expr(stmt.cond)
+                for child in stmt.body:
+                    visit_stmt(child)
+            elif isinstance(stmt, IRAssign):
+                visit_expr(stmt.target)
+                visit_expr(stmt.value)
+
+        def visit_expr(expr: IRExpr | None):
+            if expr is None:
+                return
+            if isinstance(expr, IRCallExpr):
+                visit_expr(expr.callee)
+                for arg in expr.args:
+                    visit_expr(arg)
+            elif isinstance(expr, IRGetItem):
+                visit_expr(expr.base)
+                for idx in expr.indices:
+                    if isinstance(idx, IRSlice):
+                        visit_expr(idx.start)
+                        visit_expr(idx.stop)
+                        visit_expr(idx.step)
+                    else:
+                        visit_expr(cast(IRExpr, idx))
+            elif isinstance(expr, IRGetAttr):
+                visit_expr(expr.base)
+            elif isinstance(expr, IRBinary):
+                visit_expr(expr.left)
+                visit_expr(expr.right)
+            elif isinstance(expr, IRUnary):
+                visit_expr(expr.operand)
+            elif isinstance(expr, IRIntrinsic):
+                for arg in expr.args:
+                    visit_expr(arg)
+
+        for stmt in statements:
+            visit_stmt(stmt)
+        return sources
 
     def _collect_callees(self, statements: list[Any]) -> set[str]:
         names: set[str] = set()
@@ -800,6 +1205,21 @@ class CEmitter:
             )
         )
 
+    @staticmethod
+    def _render_pointer_param(ctype: str, name: str, var: IRVar) -> str:
+        source = var.source
+        is_const = bool(getattr(source, "c_const", False)) or var.intent == "in"
+        is_restrict = bool(getattr(source, "c_restrict", False))
+        is_volatile = bool(getattr(source, "c_volatile", False))
+        prefix = []
+        if is_const:
+            prefix.append("const")
+        if is_volatile:
+            prefix.append("volatile")
+        prefix.append(ctype)
+        restrict_suffix = " restrict" if is_restrict else ""
+        return f"{' '.join(prefix)} *{restrict_suffix} {name}"
+
     def _build_signature(self, proc: IRProcedure) -> list[str]:
         arg_specs: list[str] = []
         for var in proc.args:
@@ -809,12 +1229,6 @@ class CEmitter:
             if shape is None:
                 ctype = self._map_irvar_to_ctype(var)
                 dtype = self._dtype_from_irvar(var)
-                if is_vector_dtype(dtype):
-                    self._raise_with_source(
-                        NotImplementedError,
-                        "SIMD vector values are only supported as local values, not Python-callable arguments",
-                        origin=var,
-                    )
                 pass_by_value = dtype is not None and var.intent == "in" and dtype.can_be_value()
                 is_pointer = not pass_by_value
                 self._register_symbol(
@@ -825,9 +1239,10 @@ class CEmitter:
                         pass_by_value=pass_by_value,
                     )
                 )
-                const_prefix = "const " if (var.intent == "in" and is_pointer) else ""
-                ptr = "*" if is_pointer else ""
-                arg_specs.append(f"{const_prefix}{ctype} {ptr}{var.name}")
+                if is_pointer:
+                    arg_specs.append(self._render_pointer_param(ctype, var.name, var))
+                else:
+                    arg_specs.append(f"{ctype} {var.name}")
                 continue
 
             rank = shape.rank or 1
@@ -848,7 +1263,7 @@ class CEmitter:
                 dims_exprs = ["1"] * rank
 
             ctype = self._map_irvar_to_ctype(var)
-            arg_specs.append(f"{ctype}* {var.name}")
+            arg_specs.append(self._render_pointer_param(ctype, var.name, var))
             self._register_array_symbol(
                 var.name,
                 ctype=ctype,
@@ -2875,3 +3290,46 @@ class CEmitter:
         if isinstance(value, np.generic):
             return str(value)
         return str(value)
+
+
+class CTranslationUnit:
+    def __init__(
+        self,
+        name: str | CEmitter | None = None,
+        *,
+        emitter: CEmitter | None = None,
+    ) -> None:
+        if isinstance(name, CEmitter):
+            emitter = name
+            name = None
+        self.emitter = CEmitter() if emitter is None else emitter
+        self.name = name
+        self._entries: list[CTranslationUnitEntry] = []
+
+    def add_function(
+        self,
+        function: Any,
+        *,
+        linkage: str | None = None,
+        attributes: Iterable[str] | str | None = None,
+        emit_mode: str | None = None,
+    ) -> None:
+        proc = self.emitter._coerce_procedure(function)
+        config = self.emitter._config_from_proc(
+            proc,
+            linkage=linkage,
+            attributes=attributes,
+            emit_mode=emit_mode,
+        )
+        self._entries.append(CTranslationUnitEntry(proc=proc, config=config))
+
+    def emit(self, *, include_header: bool | str = False, header_name: str | None = None) -> str:
+        source, _requires_math = self.emitter.emit_source(
+            self._entries,
+            include_header=include_header,
+            header_name=header_name,
+        )
+        return source
+
+    def emit_header(self, *, guard: str | None = None) -> str:
+        return self.emitter.emit_header(self._entries, guard=guard)

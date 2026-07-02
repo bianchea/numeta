@@ -253,6 +253,28 @@ class Vector:
 
 
 @dataclass(frozen=True)
+class PointerType:
+    """C pointer argument descriptor with optional ABI qualifiers."""
+
+    dtype: DataType
+    const: bool = False
+    restrict: bool = False
+    volatile: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "dtype", get_datatype(self.dtype))
+
+
+def ptr(dtype, *, const: bool = False, restrict: bool = False, volatile: bool = False):
+    return PointerType(
+        dtype=get_datatype(dtype),
+        const=bool(const),
+        restrict=bool(restrict),
+        volatile=bool(volatile),
+    )
+
+
+@dataclass(frozen=True)
 class ArrayType:
     """Helper object returned by DataType[x] to describe array types."""
 

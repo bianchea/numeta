@@ -7,7 +7,7 @@ from .cases import cases
 from .empty import empty
 from .zeros import zeros
 from .reshape import reshape
-from .external_library import ExternalLibraryWrapper, Arg
+from .external_library import Arg, ExternalLibraryWrapper, external_function
 from .declare_global_constant import declare_global_constant
 from .constant import constant
 from .cast import cast

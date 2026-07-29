@@ -197,7 +197,7 @@ class BuilderHelper:
             elif not isinstance(return_variables, (list, tuple)):
                 return_variables = [return_variables]
 
-            from .array_shape import ArrayShape, SCALAR, UNKNOWN
+            from .array_shape import ArrayShape
             from .ast import Shape
             from .datatype import DataType, size_t
 
@@ -223,14 +223,14 @@ class BuilderHelper:
                         self.symbolic_function.add_variable(ptr)
 
                         ret.append((var.dtype, rank))
-                    elif var._shape is SCALAR and var.name not in self.symbolic_function.arguments:
+                    elif var._shape.is_scalar and var.name not in self.symbolic_function.arguments:
 
                         var.intent = "out"
                         self.symbolic_function.add_variable(var)
 
                         ret.append((var.dtype, 0))
                     else:
-                        if var._shape is SCALAR:
+                        if var._shape.is_scalar:
                             tmp = BuilderHelper.generate_local_variables("fc_s", dtype=var.dtype)
                             tmp[:] = var
                             tmp.intent = "out"
@@ -245,7 +245,7 @@ class BuilderHelper:
                 if expr is not None:
                     # We have to copy the expression in a new array
                     expr_shape = expr._shape
-                    if expr_shape is SCALAR:
+                    if expr_shape.is_scalar:
                         tmp = BuilderHelper.generate_local_variables("fc_s", dtype=expr.dtype)
                         tmp[:] = expr
                         tmp.intent = "out"
@@ -253,7 +253,7 @@ class BuilderHelper:
                         ret.append((expr.dtype, 0))
                         continue
 
-                    if expr_shape is UNKNOWN:
+                    if expr_shape.is_unknown:
                         raise NotImplementedError(
                             "Returning arrays with unknown shape is not supported yet."
                         )

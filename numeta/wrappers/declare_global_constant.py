@@ -12,25 +12,17 @@ if TYPE_CHECKING:
     from numeta.numeta_library import NumetaLibrary
 
 _n_global_constant: int = 0
+_n_global_library: int = 0
 
 
-def declare_global_constant(
-    shape: tuple[Any, ...] | list[Any] | int | ArrayShape | AstVariable,
-    dtype: Any = float64,
-    order: str = "C",
-    name: str | None = None,
-    value: Any = None,
-    directory: str | None = None,
-    backend: str | None = None,
-    library: NumetaLibrary | None = None,
-) -> AstVariable:
-    if backend is None:
-        backend = settings.default_backend
-    if order not in ["C", "F"]:
-        raise ValueError(f"Invalid order: {order}, must be 'C' or 'F'")
+def _next_global_library_name(name: str, backend: str) -> str:
+    global _n_global_library
+    library_name = f"{name}_namespace_{backend}_{_n_global_library}"
+    _n_global_library += 1
+    return library_name
 
-    fortran_order = order == "F"
 
+def _normalize_global_constant_shape(shape, order: str) -> ArrayShape:
     def normalize_shape_argument(shape_arg):
         if isinstance(shape_arg, ArrayShape):
             return shape_arg
@@ -68,10 +60,26 @@ def declare_global_constant(
 
     normalized_shape_arg = normalize_shape_argument(shape)
     if isinstance(normalized_shape_arg, ArrayShape):
-        shape = normalized_shape_arg
-    else:
-        shape = ArrayShape(tuple(normalized_shape_arg), fortran_order=fortran_order)
+        return normalized_shape_arg
 
+    return ArrayShape(tuple(normalized_shape_arg), fortran_order=order == "F")
+
+
+def make_global_constant_target(
+    shape: tuple[Any, ...] | list[Any] | int | ArrayShape | AstVariable,
+    dtype: Any = float64,
+    order: str = "C",
+    name: str | None = None,
+    value: Any = None,
+    directory: str | None = None,
+    backend: str | None = None,
+) -> tuple[AstVariable, NumetaCompiledFunction]:
+    if backend is None:
+        backend = settings.default_backend
+    if order not in ["C", "F"]:
+        raise ValueError(f"Invalid order: {order}, must be 'C' or 'F'")
+
+    normalized_shape = _normalize_global_constant_shape(shape, order)
     dtype_arg = get_datatype(dtype)
 
     if name is None:
@@ -85,7 +93,7 @@ def declare_global_constant(
     var = AstVariable(
         name=name,
         dtype=dtype_arg,
-        shape=shape,
+        shape=normalized_shape,
         assign=value,
         # TODO
         # parameter=True, # parameter is not supported yet, so not really constant.
@@ -96,10 +104,34 @@ def declare_global_constant(
     namespace_library = NumetaCompiledFunction(
         f"{name}_namespace",
         global_constant_namespace,
+        library_name=_next_global_library_name(name, backend),
         path=directory,
         backend=backend,
     )
     global_constant_namespace.parent = namespace_library
+
+    return var, namespace_library
+
+
+def declare_global_constant(
+    shape: tuple[Any, ...] | list[Any] | int | ArrayShape | AstVariable,
+    dtype: Any = float64,
+    order: str = "C",
+    name: str | None = None,
+    value: Any = None,
+    directory: str | None = None,
+    backend: str | None = None,
+    library: NumetaLibrary | None = None,
+) -> AstVariable:
+    var, namespace_library = make_global_constant_target(
+        shape,
+        dtype=dtype,
+        order=order,
+        name=name,
+        value=value,
+        directory=directory,
+        backend=backend,
+    )
 
     if library is not None:
         library._nm_add_global(namespace_library)

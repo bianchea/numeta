@@ -8,6 +8,70 @@ from numeta.c.emitter import CEmitter
 from numeta.ir import lower_procedure
 
 
+def test_avx2_radial_seed_and_mask_intrinsics_emit():
+    @nm.jit(backend="c", simd_arch="avx2", simd_features=("fma",))
+    def radial_ops(out, inp):
+        x = nm.vload(inp, 0, lanes=4)
+        seed = nm.astype(nm.rcp_approx(nm.astype(x, nm.f4)), nm.f8)
+        corrected = nm.fma(seed, nm.fnma(x, seed, 1.0), seed)
+        mask = nm.compare(x, nm.broadcast(2.0, 4), "lt")
+        with nm.If(nm.mask_bits(mask) != 0):
+            corrected = nm.where(mask, corrected, x)
+        nm.vstore(out, 0, corrected)
+
+    radial_ops(nm.ptr(nm.f8), nm.ptr(nm.f8, const=True))
+    compiled = next(iter(radial_ops._compiled_functions.values()))
+    code, _ = CEmitter(simd_arch="avx2", simd_features=("fma",)).emit_procedure(
+        lower_procedure(compiled.symbolic_function, backend="c")
+    )
+
+    for intrinsic in (
+        "_mm256_cvtpd_ps",
+        "_mm_rcp_ps",
+        "_mm256_cvtps_pd",
+        "_mm256_fnmadd_pd",
+        "_mm256_cmp_pd",
+        "_mm256_movemask_pd",
+        "_mm256_blendv_pd",
+    ):
+        assert intrinsic in code
+
+
+def test_avx2_table_and_exponent_intrinsics_emit():
+    @nm.jit(backend="c", simd_arch="avx2", simd_features=("fma",))
+    def interval(out, table, x):
+        rounded = nm.vector(nm.f8, 4, name="rounded")
+        index = nm.vector(nm.i4, 4, name="index")
+        center = nm.vector(nm.f8, 4, name="center")
+        rounded[:] = nm.floor(nm.fma(x, nm.broadcast(8.0, 4), nm.broadcast(0.5, 4)))
+        index[:] = nm.astype(rounded, nm.i4)
+        center[:] = nm.astype(index, nm.f8) * nm.broadcast(0.125, 4)
+        value = nm.vector_from_values(
+            table[nm.extract_lane(index, 0)],
+            table[nm.extract_lane(index, 1)],
+            table[nm.extract_lane(index, 2)],
+            table[nm.extract_lane(index, 3)],
+        )
+        nm.vstore(out, 0, value + x - center + nm.exp2_neg(index))
+
+    interval(nm.ptr(nm.f8), nm.ptr(nm.f8, const=True), nm.Vector[nm.f8, 4])
+    compiled = next(iter(interval._compiled_functions.values()))
+    code, _ = CEmitter(simd_arch="avx2", simd_features=("fma",)).emit_procedure(
+        lower_procedure(compiled.symbolic_function, backend="c")
+    )
+
+    for intrinsic in (
+        "_mm256_floor_pd",
+        "_mm256_cvttpd_epi32",
+        "_mm256_cvtepi32_pd",
+        "_mm_extract_epi32",
+        "_mm256_set_pd",
+        "_mm256_cvtepi32_epi64",
+        "_mm256_slli_epi64",
+    ):
+        assert intrinsic in code
+
+
 def _emit_axpy_code(simd_arch="scalar", simd_features=()):
     @nm.jit(backend="c", simd_arch=simd_arch, simd_features=simd_features)
     def axpy(a, x, y, n):
@@ -391,6 +455,30 @@ def test_simd_reduce_sum_scalar_fallback_run():
     np.testing.assert_allclose(sum4(x), x.sum())
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        (nm.unpack_low, np.array([1.0, 10.0, 3.0, 30.0])),
+        (nm.unpack_high, np.array([2.0, 20.0, 4.0, 40.0])),
+        (nm.pairwise_halves_sum, np.array([4.0, 6.0, 40.0, 60.0])),
+    ],
+)
+def test_simd_lane_permutation_scalar_fallback_run(operation, expected):
+    @nm.jit(backend="c", simd_arch="scalar")
+    def permute(a, b, out):
+        av = nm.vload(a, 0, lanes=4)
+        bv = nm.vload(b, 0, lanes=4)
+        nm.vstore(out, 0, operation(av, bv))
+
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    b = np.array([10.0, 20.0, 30.0, 40.0])
+    out = np.zeros(4)
+
+    permute(a, b, out)
+
+    np.testing.assert_allclose(out, expected)
+
+
 @pytest.mark.skipif(not _cpu_supports("avx2"), reason="AVX2 is not available on this CPU")
 def test_simd_avx2_run_axpy():
     @nm.jit(
@@ -414,6 +502,42 @@ def test_simd_avx2_run_axpy():
     axpy(np.float64(3.0), x, y, np.int64(x.size))
 
     np.testing.assert_allclose(y, expected)
+
+
+@pytest.mark.skipif(not _cpu_supports("avx2"), reason="AVX2 is not available on this CPU")
+@pytest.mark.parametrize(
+    ("operation", "expected", "intrinsic"),
+    [
+        (nm.unpack_low, np.array([1.0, 10.0, 3.0, 30.0]), "_mm256_unpacklo_pd"),
+        (nm.unpack_high, np.array([2.0, 20.0, 4.0, 40.0]), "_mm256_unpackhi_pd"),
+        (
+            nm.pairwise_halves_sum,
+            np.array([4.0, 6.0, 40.0, 60.0]),
+            "_mm256_permute2f128_pd",
+        ),
+    ],
+)
+def test_simd_lane_permutation_avx2_run(tmp_path, operation, expected, intrinsic):
+    @nm.jit(
+        backend="c",
+        directory=tmp_path,
+        simd_arch="avx2",
+        compile_flags="-O2 -mavx2",
+    )
+    def permute(a, b, out):
+        av = nm.vload(a, 0, lanes=4)
+        bv = nm.vload(b, 0, lanes=4)
+        nm.vstore(out, 0, operation(av, bv))
+
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    b = np.array([10.0, 20.0, 30.0, 40.0])
+    out = np.zeros(4)
+
+    permute(a, b, out)
+
+    source = next(tmp_path.glob(f"{permute.name}_*_src.c")).read_text()
+    assert intrinsic in source
+    np.testing.assert_allclose(out, expected)
 
 
 @pytest.mark.skipif(not _cpu_supports("avx2"), reason="AVX2 is not available on this CPU")

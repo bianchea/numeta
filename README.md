@@ -358,6 +358,86 @@ lib.save("./build")
 Reload in a fresh process when you need guaranteed use of the relinked shared
 library.
 
+#### Library replacement and artifact APIs
+
+Replacement can be eager or lazy. Eager replacement recompiles existing
+specializations immediately. Lazy replacement preserves the old compiled
+specializations as fallbacks and compiles the new implementation on future cache
+misses:
+
+```python
+# Recompile all existing specializations now.
+lib.replace(add, mode="eager", compile_now=True)
+
+# Install new Python/symbolic code without compiling immediately.
+lib.replace(add, mode="lazy", compile_now=False)
+```
+
+Use `signatures=` to replace selected specializations and `non_selected=` with
+`"preserve"`, `"invalidate"`, or `"error"` to control the remainder.
+`compile_replacement()` compiles a replacement and returns its symbol, object
+files, dependency objects, include directories, and stable `signature_id`
+without requiring `save()` first.
+
+The related inspection methods are:
+
+- `signature_id(name, signature)` and `signature_from_id(name, signature_id)`
+- `signature_to_json(signature)` and `signature_ids(name)`
+- `link_plan_for_symbol(name_or_symbol, signature=None)`
+- `dependency_objects_for_symbol(name_or_symbol, signature=None)`
+- `clear_generated_state(functions=None, include_globals=False)`
+
+Saved libraries now contain a versioned artifact manifest. Paths in the
+manifest are relative to the library directory, so the complete saved directory
+can be moved and loaded from another location. Loading reports missing persisted
+objects explicitly rather than silently selecting an unrelated object file.
+Pass `ignore_corrupt=True` to treat malformed cache metadata as a cache miss.
+Library metadata uses Python pickle, so this option does not make untrusted
+library files safe to load.
+
+#### Library global constants
+
+Register a generated global constant with a library when compiled functions
+should share it:
+
+```python
+table = nm.declare_global_constant(
+    (4,),
+    dtype=nm.float64,
+    value=np.array([1.0, 2.0, 3.0, 4.0]),
+    name="table",
+    library=lib,
+)
+
+@nm.jit(library=lib)
+def read_table(out):
+    out[:] = table[:]
+```
+
+`lib.replace_global_constant("table", value=new_value)` updates the generated
+global while preserving the dependency object used by existing generated
+callers. Shape changes are rejected by default because callers may have compiled
+the old dimensions into their code.
+
+### Slicing and C temporary allocation
+
+Positive slice steps are supported, including expressions such as `a[::2]` and
+`a[1:10:3]`. Negative steps remain unsupported and produce a source-located
+error.
+
+For the C backend, `nm.settings.c_temporary_allocation` controls storage only
+when lowering actually requires a temporary:
+
+- `"heap"` uses dynamic allocation.
+- `"stack"` uses fixed-size stack storage.
+- `"auto"` uses stack storage up to
+  `nm.settings.c_stack_temporary_max_bytes`, then uses the heap.
+
+Runtime-sized stack temporaries additionally require
+`nm.settings.c_allow_vla_temporaries = True`. Contiguous slices may be passed as
+direct pointers and therefore do not allocate a temporary regardless of this
+policy.
+
 ## Examples
 
 ### First For Loop

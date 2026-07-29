@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from numeta.array_shape import ArrayShape, SCALAR, UNKNOWN
+from numeta.array_shape import ArrayShape
 from numeta.settings import settings
 from numeta.indexing import to_fortran_index, to_fortran_slice_start, to_fortran_slice_stop
 from numeta.exceptions import raise_with_source
@@ -529,10 +529,10 @@ def _render_variable_declaration_blocks(stmt: VariableDeclaration) -> list[str]:
         result += ["("] + [":", ","] * (stmt.variable._shape.rank - 1) + [":", ")"]
     elif stmt.variable.pointer:
         result += [", ", "pointer"]
-        if stmt.variable._shape is not SCALAR:
+        if not stmt.variable._shape.is_scalar:
             result += [", ", "dimension"]
             result += ["("] + [":", ","] * (stmt.variable._shape.rank - 1) + [":", ")"]
-    elif stmt.variable._shape is UNKNOWN:
+    elif stmt.variable._shape.is_unknown:
         result += [", ", "dimension", "(", "1", ":", "*", ")"]
     elif stmt.variable._shape.rank > 0:
         result += [", ", "dimension"]
@@ -546,7 +546,7 @@ def _render_variable_declaration_blocks(stmt: VariableDeclaration) -> list[str]:
         result += [", ", "intent", "(", stmt.variable.intent, ")"]
 
     if syntax_settings.force_value:
-        if stmt.variable._shape is SCALAR and stmt.variable.intent == "in":
+        if stmt.variable._shape.is_scalar and stmt.variable.intent == "in":
             result += [", ", "value"]
 
     if stmt.variable.parameter:
@@ -584,7 +584,7 @@ def _render_variable_declaration_blocks(stmt: VariableDeclaration) -> list[str]:
             )
             raise AssertionError("unreachable")
 
-        if stmt.variable._shape is UNKNOWN:
+        if stmt.variable._shape.is_unknown:
             raise_with_source(
                 ValueError,
                 "Cannot assign to a variable with unknown shape. "

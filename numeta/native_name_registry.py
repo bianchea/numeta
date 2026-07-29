@@ -11,5 +11,11 @@ class NativeNameRegistry:
     def reserve_many(self, names) -> None:
         self.reserved_names.update(names)
 
+    def release(self, name: str) -> None:
+        self.reserved_names.discard(name)
+
+    def release_many(self, names) -> None:
+        self.reserved_names.difference_update(names)
+
 
 native_name_registry = NativeNameRegistry()

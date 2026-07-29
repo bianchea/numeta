@@ -31,15 +31,16 @@ class GetItem(ExpressionNode):
             return cached_shape
 
         dims = []
+
+        def append_slice_dim(slice_, max_dim):
+            try:
+                dims.append(get_slice_dim(slice_, max_dim))
+            except NotImplementedError as exc:
+                raise_with_source(NotImplementedError, str(exc), source_node=self)
+
         if self.variable._shape is UNKNOWN:
             if isinstance(self.sliced, slice):
-                if self.sliced.step is not None:
-                    raise_with_source(
-                        NotImplementedError,
-                        "Step slicing not implemented for shape extraction",
-                        source_node=self,
-                    )
-                dims.append(get_slice_dim(self.sliced, None))
+                append_slice_dim(self.sliced, None)
             else:
                 self._shape_cache = SCALAR
                 return SCALAR
@@ -52,22 +53,10 @@ class GetItem(ExpressionNode):
                 return SCALAR
             for i, element in enumerate(self.sliced):
                 if isinstance(element, slice):
-                    if element.step is not None:
-                        raise_with_source(
-                            NotImplementedError,
-                            "Step slicing not implemented for shape extraction",
-                            source_node=self,
-                        )
-                    dims.append(get_slice_dim(element, self.variable._shape.dim(i)))
+                    append_slice_dim(element, self.variable._shape.dim(i))
         else:
             if isinstance(self.sliced, slice):
-                if self.sliced.step is not None:
-                    raise_with_source(
-                        NotImplementedError,
-                        "Step slicing not implemented for shape extraction",
-                        source_node=self,
-                    )
-                dims.append(get_slice_dim(self.sliced, self.variable._shape.dim(0)))
+                append_slice_dim(self.sliced, self.variable._shape.dim(0))
             else:
                 self._shape_cache = SCALAR
                 return SCALAR

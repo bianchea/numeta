@@ -21,6 +21,7 @@ class Variable(NamedEntity, ExpressionNode):
         use_c_types=False,
         pass_by_value=None,
         c_const=False,
+        c_static=False,
         c_restrict=False,
         c_volatile=False,
     ):
@@ -49,6 +50,7 @@ class Variable(NamedEntity, ExpressionNode):
         self.bind_c = bind_c
         self.pass_by_value = pass_by_value
         self.c_const = bool(c_const)
+        self.c_static = bool(c_static)
         self.c_restrict = bool(c_restrict)
         self.c_volatile = bool(c_volatile)
 

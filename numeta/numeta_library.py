@@ -1,21 +1,57 @@
-import numpy as np
 import os
-import shutil
+import pickle
 import sys
 import tempfile
-
+from contextlib import contextmanager
 from pathlib import Path
-import pickle
-import warnings
+from time import perf_counter
 from types import MappingProxyType
 from typing import Iterable
+import warnings
 
-from .numeta_function import NumetaFunction, NumetaCompiledFunction
-from .native_name_registry import native_name_registry
-from .pyc_extension import PyCExtension
+import numpy as np
+
 from .compiler import Compiler
-from .settings import settings
 from .datatype import DataTypeMeta, make_struct_type
+from .library_artifacts import (
+    _load_compiled_artifact_graph,
+    _persist_compiled_artifacts,
+)
+from .library_linking import (
+    _active_compiled_targets_by_name,
+    _collect_compiled_target_closure,
+    _link_plan_for_compiled_target,
+)
+from .library_replacement import (
+    adopt_compiled_target_state as _replace_compiled_target_state,
+    single_global_variable as _single_global_variable,
+    validate_function_compatibility as _validate_function_level_compatibility,
+    validate_global_compatibility as _validate_global_replacement_compatibility,
+    validate_specialization_compatibility as _validate_specialization_compatibility,
+)
+from .library_signature import signature_id as _signature_id
+from .library_signature import signature_to_jsonable as _signature_to_jsonable
+from .native_name_registry import native_name_registry
+from .numeta_function import NumetaCompiledFunction, NumetaFunction
+from .pyc_extension import PyCExtension
+from .settings import settings
+
+
+def _emit_timing(timing_callback, phase: str, elapsed_s: float, **metadata) -> None:
+    if timing_callback is None:
+        return
+    event = {"phase": phase, "elapsed_s": elapsed_s}
+    event.update(metadata)
+    timing_callback(event)
+
+
+@contextmanager
+def _timing_phase(timing_callback, phase: str, **metadata):
+    start = perf_counter()
+    try:
+        yield
+    finally:
+        _emit_timing(timing_callback, phase, perf_counter() - start, **metadata)
 
 
 def _pickleable_or_none(value, *, description: str):
@@ -48,114 +84,6 @@ def _rebuild_struct_type(np_dtype, members, name):
     return make_struct_type(np_dtype, members, name=name)
 
 
-def _artifact_dir_for_compiled(directory: Path, compiled: NumetaCompiledFunction) -> Path:
-    return directory / "artifacts" / "compiled" / compiled.func_name
-
-
-def _source_suffix_for(compiled: NumetaCompiledFunction) -> str:
-    if compiled.backend == "fortran":
-        return "_src.f90"
-    if compiled.backend == "c":
-        return "_src.c"
-    raise ValueError(f"Unsupported backend: {compiled.backend}")
-
-
-def _source_path_for(compiled: NumetaCompiledFunction) -> Path:
-    return Path(compiled._path) / f"{compiled.func_name}{_source_suffix_for(compiled)}"
-
-
-def _copy_if_different(source: Path, target: Path) -> None:
-    if source.absolute() == target.absolute():
-        return
-    shutil.copy2(source, target)
-
-
-def _persist_compiled_artifacts(
-    compiled: NumetaCompiledFunction,
-    directory: Path,
-) -> tuple[Path, Path | None, Path]:
-    old_obj_file = compiled.obj_files[0]
-
-    target_dir = _artifact_dir_for_compiled(directory, compiled)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    saved_obj_file = target_dir / old_obj_file.name
-    _copy_if_different(old_obj_file, saved_obj_file)
-
-    saved_src_file = None
-    source_paths = []
-    for source_file in getattr(compiled, "_source_files", ()):
-        source_path = Path(source_file)
-        if source_path.exists():
-            source_paths.append(source_path)
-
-    generated_source = _source_path_for(compiled)
-    if generated_source.exists() and generated_source not in source_paths:
-        source_paths.append(generated_source)
-
-    for source_path in source_paths:
-        target_source = target_dir / source_path.name
-        _copy_if_different(source_path, target_source)
-        if saved_src_file is None and source_path.name.endswith(_source_suffix_for(compiled)):
-            saved_src_file = target_source
-
-    for side_product in Path(compiled._path).glob("*.mod"):
-        _copy_if_different(side_product, target_dir / side_product.name)
-
-    return saved_obj_file, saved_src_file, target_dir
-
-
-def _validate_function_level_compatibility(
-    old_func: NumetaFunction,
-    new_func: NumetaFunction,
-) -> None:
-    if old_func.backend != new_func.backend:
-        raise ValueError("Cannot replace function with different backend")
-
-    if tuple(old_func.compile_flags) != tuple(new_func.compile_flags):
-        raise ValueError(
-            "Cannot replace function with different compile_flags in minimal incremental mode"
-        )
-
-    if old_func.do_checks != new_func.do_checks:
-        raise ValueError(
-            "Cannot replace function with different do_checks in minimal incremental mode"
-        )
-
-    if old_func.inline or new_func.inline:
-        raise ValueError("replace() does not support inline functions yet")
-
-
-def _validate_specialization_compatibility(
-    old_func: NumetaFunction,
-    new_func: NumetaFunction,
-    signature,
-) -> None:
-    old_spec = old_func._wrapper_specs.get(signature)
-    if old_spec is None:
-        old_spec = old_func.build_wrapper_spec(signature)
-
-    new_spec = new_func._wrapper_specs.get(signature)
-    if new_spec is None:
-        new_spec = new_func.build_wrapper_spec(signature)
-
-    old_name, old_args, old_returns = old_spec
-    new_name, new_args, new_returns = new_spec
-
-    if old_name != new_name:
-        raise AssertionError("replacement did not preserve compiled symbol name")
-
-    if old_args != new_args:
-        raise ValueError(
-            f"Replacement for {old_func.name!r} changed argument ABI for signature {signature!r}"
-        )
-
-    if old_returns != new_returns:
-        raise ValueError(
-            f"Replacement for {old_func.name!r} changed return ABI for signature {signature!r}"
-        )
-
-
 class NumetaLibrary:
     __slots__ = "name", "_entries", "_global_entries"
     loaded = set()
@@ -166,11 +94,20 @@ class NumetaLibrary:
         "register",
         "remove",
         "replace",
+        "replace_global_constant",
+        "clear_generated_state",
         "list_functions",
         "signatures",
+        "signature_id",
+        "signature_ids",
+        "signature_from_id",
+        "signature_to_json",
         "compiled_symbols",
         "signature_for_call",
         "compiled_function",
+        "dependency_objects_for_symbol",
+        "link_plan_for_symbol",
+        "compile_replacement",
         "save",
         "load",
         "print_f90_files",
@@ -222,6 +159,96 @@ class NumetaLibrary:
     def remove(self, name: str) -> NumetaFunction:
         return self._entries.pop(name)
 
+    def replace_global_constant(
+        self,
+        name: str,
+        *,
+        value=None,
+        shape=None,
+        dtype=None,
+        order: str | None = None,
+        directory: str | Path | None = None,
+        backend: str | None = None,
+        compile_now: bool = True,
+        allow_shape_change: bool = False,
+    ):
+        namespace_name = f"{name}_namespace"
+        if namespace_name not in self._global_entries:
+            raise KeyError(f"Cannot replace unknown global constant {name!r}")
+
+        old_target = self._global_entries[namespace_name]
+        old_var = _single_global_variable(old_target)
+        if old_var.name != name:
+            raise KeyError(
+                f"Global namespace {namespace_name!r} contains {old_var.name!r}, not {name!r}"
+            )
+
+        if shape is None:
+            shape = old_var._shape
+        if dtype is None:
+            dtype = old_var.dtype
+        if order is None:
+            order = "F" if old_var._shape.fortran_order else "C"
+        if directory is None:
+            directory = old_target._path
+        if backend is None:
+            backend = old_target.backend
+
+        from .wrappers.declare_global_constant import make_global_constant_target
+
+        new_var, new_target = make_global_constant_target(
+            shape,
+            dtype=dtype,
+            order=order,
+            name=name,
+            value=value,
+            directory=str(directory) if directory is not None else None,
+            backend=backend,
+        )
+        _validate_global_replacement_compatibility(
+            old_target,
+            new_target,
+            allow_shape_change=allow_shape_change,
+        )
+
+        _replace_compiled_target_state(old_target, new_target)
+        self._global_entries[namespace_name] = old_target
+
+        if compile_now:
+            old_target.compile_obj()
+
+        return new_var
+
+    def clear_generated_state(
+        self,
+        *,
+        functions: Iterable[str | NumetaFunction] | str | NumetaFunction | None = None,
+        include_globals: bool = False,
+        release_names: bool = True,
+    ) -> None:
+        if functions is None:
+            selected_functions = list(self._entries.values())
+        elif isinstance(functions, str):
+            selected_functions = [self._entries[functions]]
+        elif isinstance(functions, NumetaFunction):
+            selected_functions = [functions]
+        else:
+            selected_functions = [
+                self._entries[item] if isinstance(item, str) else item for item in functions
+            ]
+
+        for function in selected_functions:
+            if not isinstance(function, NumetaFunction):
+                raise TypeError("functions must contain names or NumetaFunction instances")
+            function.clear_generated_state(release_names=release_names)
+
+        if include_globals:
+            if release_names:
+                native_name_registry.release_many(
+                    global_target.func_name for global_target in self._global_entries.values()
+                )
+            self._global_entries.clear()
+
     def replace(
         self,
         name_or_function: str | NumetaFunction,
@@ -231,13 +258,27 @@ class NumetaLibrary:
         require_existing_specializations: bool = True,
         signatures: Iterable | None = None,
         non_selected: str = "preserve",
+        mode: str | None = None,
+        timing_callback=None,
     ) -> NumetaFunction:
+        replace_start = perf_counter()
         valid_non_selected = {"preserve", "invalidate", "error"}
         if non_selected not in valid_non_selected:
             raise ValueError(
                 "non_selected must be one of "
                 f"{', '.join(sorted(repr(policy) for policy in valid_non_selected))}"
             )
+        valid_modes = {"eager", "lazy"}
+        if mode is None:
+            mode = "lazy" if signatures is None and not compile_now else "eager"
+        elif mode not in valid_modes:
+            raise ValueError(
+                "mode must be one of " f"{', '.join(sorted(repr(mode) for mode in valid_modes))}"
+            )
+        if mode == "lazy" and compile_now:
+            raise ValueError("replace(..., mode='lazy') cannot use compile_now=True")
+        if mode == "lazy" and signatures is not None:
+            raise ValueError("replace(..., mode='lazy') cannot also pass signatures")
 
         if function is None:
             if not isinstance(name_or_function, NumetaFunction):
@@ -279,7 +320,16 @@ class NumetaLibrary:
         _validate_function_level_compatibility(old_func, new_func)
 
         old_signatures = tuple(old_func._compiled_functions)
-        if signatures is None:
+        if mode == "lazy":
+            selected_signatures = ()
+            unselected_signatures = list(old_signatures)
+            if non_selected == "error" and unselected_signatures:
+                raise ValueError(
+                    f"replace(..., mode='lazy', non_selected='error') received "
+                    f"{len(unselected_signatures)} existing specialization(s) for {name!r}"
+                )
+            preserve_unselected = non_selected == "preserve"
+        elif signatures is None:
             selected_signatures = old_signatures
             preserve_unselected = False
         else:
@@ -308,15 +358,7 @@ class NumetaLibrary:
                 )
             preserve_unselected = non_selected == "preserve"
 
-        original_state = {
-            "name": new_func.name,
-            "return_signatures": new_func.return_signatures.copy(),
-            "_compiled_functions": new_func._compiled_functions.copy(),
-            "_wrapper_specs": new_func._wrapper_specs.copy(),
-            "_pyc_extensions": new_func._pyc_extensions.copy(),
-            "_library_pyc_extension": new_func._library_pyc_extension,
-            "_fast_call": new_func._fast_call.copy(),
-        }
+        original_state = new_func.snapshot_generated_state()
         names_added_by_replace = []
 
         try:
@@ -326,19 +368,33 @@ class NumetaLibrary:
                 if not native_name_registry.is_reserved(old_symbol):
                     names_added_by_replace.append(old_symbol)
 
-                new_func._wrapper_specs.pop(signature, None)
-                new_func._pyc_extensions.pop(signature, None)
-                new_func._fast_call.pop(signature, None)
-                new_func.construct_compiled_target(
-                    signature,
-                    forced_name=old_symbol,
-                    allow_existing_name=True,
-                )
-                new_func.construct_wrapper_spec(signature)
-                _validate_specialization_compatibility(old_func, new_func, signature)
+                with _timing_phase(
+                    timing_callback,
+                    "replace.construct",
+                    function=name,
+                    signature_id=_signature_id(signature),
+                    symbol=old_symbol,
+                ):
+                    new_func._wrapper_specs.pop(signature, None)
+                    new_func._pyc_extensions.pop(signature, None)
+                    new_func._fast_call.pop(signature, None)
+                    new_func.construct_compiled_target(
+                        signature,
+                        forced_name=old_symbol,
+                        allow_existing_name=True,
+                    )
+                    new_func.construct_wrapper_spec(signature)
+                    _validate_specialization_compatibility(old_func, new_func, signature)
 
                 if compile_now:
-                    new_func._compiled_functions[signature].compile_obj()
+                    with _timing_phase(
+                        timing_callback,
+                        "replace.compile_obj",
+                        function=name,
+                        signature_id=_signature_id(signature),
+                        symbol=old_symbol,
+                    ):
+                        new_func._compiled_functions[signature].compile_obj()
 
             if preserve_unselected:
                 for signature in old_signatures:
@@ -361,13 +417,8 @@ class NumetaLibrary:
                         new_func._fast_call[signature] = old_func._fast_call[signature]
 
         except Exception:
-            new_func.name = original_state["name"]
-            new_func.return_signatures = original_state["return_signatures"]
-            new_func._compiled_functions = original_state["_compiled_functions"]
-            new_func._wrapper_specs = original_state["_wrapper_specs"]
-            new_func._pyc_extensions = original_state["_pyc_extensions"]
-            new_func._library_pyc_extension = original_state["_library_pyc_extension"]
-            new_func._fast_call = original_state["_fast_call"]
+            new_func.restore_generated_state(original_state)
+            native_name_registry.release_many(names_added_by_replace)
             raise
 
         new_func.name = name
@@ -384,13 +435,172 @@ class NumetaLibrary:
                 RuntimeWarning,
             )
 
+        _emit_timing(
+            timing_callback,
+            "replace.total",
+            perf_counter() - replace_start,
+            function=name,
+            signatures=len(selected_signatures),
+        )
         return new_func
+
+    def compile_replacement(
+        self,
+        name_or_function: str | NumetaFunction,
+        function: NumetaFunction | None = None,
+        *,
+        signature=None,
+        signatures: Iterable | None = None,
+        require_existing_specializations: bool = True,
+        non_selected: str = "preserve",
+        timing_callback=None,
+    ):
+        if signature is not None and signatures is not None:
+            raise ValueError("Pass either signature or signatures, not both")
+
+        if function is None:
+            if not isinstance(name_or_function, NumetaFunction):
+                raise TypeError("compile_replacement(function) expects a NumetaFunction")
+            name = name_or_function.name
+        else:
+            if not isinstance(name_or_function, str):
+                raise TypeError("compile_replacement(name, function) expects name to be a string")
+            name = name_or_function
+
+        selected_signatures = None
+        single_signature = signature is not None
+        if signature is not None:
+            selected_signatures = (self._resolve_signature_reference(name, signature),)
+        elif signatures is not None:
+            selected_signatures = tuple(
+                self._resolve_signature_reference(name, item) for item in signatures
+            )
+
+        replaced = self.replace(
+            name_or_function,
+            function,
+            compile_now=True,
+            require_existing_specializations=require_existing_specializations,
+            signatures=selected_signatures,
+            non_selected=non_selected,
+            timing_callback=timing_callback,
+        )
+
+        if selected_signatures is None:
+            selected_signatures = tuple(replaced._compiled_functions)
+
+        artifacts = []
+        for selected_signature in selected_signatures:
+            plan = self.link_plan_for_symbol(name, selected_signature)
+            artifacts.append(
+                {
+                    "function": name,
+                    "signature": selected_signature,
+                    "signature_id": self.signature_id(name, selected_signature),
+                    **plan,
+                }
+            )
+
+        if single_signature:
+            return artifacts[0]
+        return artifacts
+
+    def _resolve_signature_reference(self, name: str, signature):
+        if isinstance(signature, str) and signature.startswith(f"sig-v{SIGNATURE_ID_VERSION}-"):
+            return self.signature_from_id(name, signature)
+        return signature
+
+    def _compiled_target_for_symbol(
+        self,
+        symbol_or_function: str | NumetaFunction | NumetaCompiledFunction,
+        signature=None,
+    ) -> NumetaCompiledFunction:
+        active_targets = _active_compiled_targets_by_name(
+            self._entries,
+            self._global_entries,
+        )
+        if isinstance(symbol_or_function, NumetaCompiledFunction):
+            return active_targets.get(symbol_or_function.func_name, symbol_or_function)
+
+        if isinstance(symbol_or_function, NumetaFunction):
+            name = symbol_or_function.name
+            function = self._entries.get(name, symbol_or_function)
+        elif isinstance(symbol_or_function, str):
+            if signature is None and symbol_or_function not in self._entries:
+                target = active_targets.get(symbol_or_function)
+                if target is not None:
+                    return target
+                raise KeyError(f"Unknown compiled symbol {symbol_or_function!r}")
+            name = symbol_or_function
+            function = self._entries[name]
+        else:
+            raise TypeError("Expected a function name, compiled symbol, or NumetaFunction")
+
+        if signature is not None:
+            signature = self._resolve_signature_reference(name, signature)
+            try:
+                return function._compiled_functions[signature]
+            except KeyError as exc:
+                raise KeyError(
+                    f"Function {name!r} has no compiled specialization for signature {signature!r}"
+                ) from exc
+
+        if len(function._compiled_functions) != 1:
+            raise ValueError(
+                f"Function {name!r} has {len(function._compiled_functions)} compiled "
+                "specialization(s); pass signature=... to select one"
+            )
+        return next(iter(function._compiled_functions.values()))
+
+    def dependency_objects_for_symbol(
+        self,
+        symbol_or_function: str | NumetaFunction | NumetaCompiledFunction,
+        signature=None,
+        *,
+        include_root: bool = True,
+    ) -> list[Path]:
+        plan = self.link_plan_for_symbol(symbol_or_function, signature)
+        if include_root:
+            return list(plan["object_files"])
+        return list(plan["dependency_objects"])
+
+    def link_plan_for_symbol(
+        self,
+        symbol_or_function: str | NumetaFunction | NumetaCompiledFunction,
+        signature=None,
+    ) -> dict:
+        target = self._compiled_target_for_symbol(symbol_or_function, signature)
+        active_targets = _active_compiled_targets_by_name(
+            self._entries,
+            self._global_entries,
+        )
+        return _link_plan_for_compiled_target(target, active_targets)
 
     def list_functions(self) -> list[str]:
         return list(self._entries)
 
     def signatures(self, name: str) -> list:
         return list(self._entries[name]._compiled_functions)
+
+    def signature_to_json(self, signature) -> dict:
+        return _signature_to_jsonable(signature)
+
+    def signature_id(self, name: str, signature) -> str:
+        if name not in self._entries:
+            raise KeyError(name)
+        return _signature_id(signature)
+
+    def signature_ids(self, name: str) -> dict:
+        return {
+            signature: self.signature_id(name, signature)
+            for signature in self._entries[name]._compiled_functions
+        }
+
+    def signature_from_id(self, name: str, signature_id: str):
+        for signature in self._entries[name]._compiled_functions:
+            if self.signature_id(name, signature) == signature_id:
+                return signature
+        raise KeyError(f"Function {name!r} has no compiled signature with id {signature_id!r}")
 
     def compiled_symbols(self, name: str) -> dict:
         return {
@@ -441,10 +651,10 @@ class NumetaLibrary:
     def _nm_add_global(self, global_target: NumetaCompiledFunction) -> None:
         if not isinstance(global_target, NumetaCompiledFunction):
             raise TypeError("global registration expects a NumetaCompiledFunction")
-        existing = self._global_entries.get(global_target.library_name)
+        existing = self._global_entries.get(global_target.func_name)
         if existing is not None and existing is not global_target:
-            raise ValueError(f"Global namespace '{global_target.library_name}' already registered")
-        self._global_entries[global_target.library_name] = global_target
+            raise ValueError(f"Global namespace '{global_target.func_name}' already registered")
+        self._global_entries[global_target.func_name] = global_target
 
     def _nm_get(self, name) -> NumetaFunction | None:
         return self._entries.get(name)
@@ -452,57 +662,70 @@ class NumetaLibrary:
     def write_code(self, directory: str | Path) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
+        roots = []
         for nm_function in self._entries.values():
-            for compiled_target in nm_function._compiled_functions.values():
-                if compiled_target.backend == "fortran":
-                    fortran_src = directory / f"{compiled_target.func_name}_src.f90"
+            roots.extend(nm_function._compiled_functions.values())
+        roots.extend(self._global_entries.values())
+
+        active_targets = _active_compiled_targets_by_name(
+            self._entries,
+            self._global_entries,
+        )
+        compiled_targets = _collect_compiled_target_closure(roots, active_targets)
+
+        from .ast.namespace import Namespace
+
+        for compiled_target in compiled_targets:
+            if compiled_target.backend == "fortran":
+                fortran_src = directory / f"{compiled_target.func_name}_src.f90"
+                if isinstance(compiled_target.symbolic_function, Namespace):
+                    from .fortran.fortran_syntax import render_stmt_lines
+
+                    lines = render_stmt_lines(
+                        compiled_target.symbolic_function.get_declaration(), indent=0
+                    )
+                    fortran_src.write_text("".join(lines))
+                else:
                     from .ir import FortranEmitter, lower_procedure
 
                     ir_proc = lower_procedure(compiled_target.symbolic_function)
                     emitter = FortranEmitter()
                     fortran_src.write_text(emitter.emit_procedure(ir_proc))
-                elif compiled_target.backend == "c":
-                    from numeta.c.emitter import CEmitter
-                    from .ir import lower_procedure
-
-                    c_src = directory / f"{compiled_target.func_name}_src.c"
-                    ir_proc = lower_procedure(compiled_target.symbolic_function)
-                    emitter = CEmitter()
-                    c_code, _requires_math = emitter.emit_procedure(ir_proc)
-                    c_src.write_text(c_code)
-                else:
-                    raise ValueError(f"Unsupported backend: {compiled_target.backend}")
-
-        for global_target in self._global_entries.values():
-            if global_target.backend == "fortran":
-                fortran_src = directory / f"{global_target.func_name}_src.f90"
-                from .ast.namespace import Namespace
-                from .fortran.fortran_syntax import render_stmt_lines
-
-                if not isinstance(global_target.symbolic_function, Namespace):
-                    raise ValueError("Global target must be backed by a namespace")
-                lines = render_stmt_lines(
-                    global_target.symbolic_function.get_declaration(), indent=0
-                )
-                fortran_src.write_text("".join(lines))
-            elif global_target.backend == "c":
-                from .ast.namespace import Namespace
+            elif compiled_target.backend == "c":
                 from numeta.c.emitter import CEmitter
 
-                c_src = directory / f"{global_target.func_name}_src.c"
-                if not isinstance(global_target.symbolic_function, Namespace):
-                    raise ValueError("Global target must be backed by a namespace")
-                emitter = CEmitter()
-                c_code, _requires_math = emitter.emit_namespace(global_target.symbolic_function)
+                c_src = directory / f"{compiled_target.func_name}_src.c"
+                emitter = CEmitter(
+                    simd_arch=getattr(compiled_target, "simd_arch", settings.default_simd_arch),
+                    simd_features=getattr(
+                        compiled_target,
+                        "simd_features",
+                        settings.default_simd_features,
+                    ),
+                )
+                if isinstance(compiled_target.symbolic_function, Namespace):
+                    c_code, _requires_math = emitter.emit_namespace(
+                        compiled_target.symbolic_function
+                    )
+                else:
+                    from .ir import lower_procedure
+
+                    ir_proc = lower_procedure(
+                        compiled_target.symbolic_function,
+                        backend="c",
+                    )
+                    c_code, _requires_math = emitter.emit_procedure(ir_proc)
                 c_src.write_text(c_code)
             else:
-                raise ValueError(f"Unsupported backend: {global_target.backend}")
+                raise ValueError(f"Unsupported backend: {compiled_target.backend}")
 
     def save(
         self,
         directory: str | Path,
         compile_flags: str | Iterable[str] | None = None,
+        timing_callback=None,
     ) -> Path:
+        save_start = perf_counter()
         directory = Path(directory).absolute()
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -514,10 +737,11 @@ class NumetaLibrary:
         # Create the interface of only the functions owned by the library
         #
 
-        procedures_infos = []
-        for function in self._entries.values():
-            procedures_infos.extend(function._wrapper_specs.values())
-        procedures_infos = NumetaFunction._deduplicate_wrapper_specs(procedures_infos)
+        with _timing_phase(timing_callback, "save.wrapper_specs"):
+            procedures_infos = []
+            for function in self._entries.values():
+                procedures_infos.extend(function._wrapper_specs.values())
+            procedures_infos = NumetaFunction._deduplicate_wrapper_specs(procedures_infos)
 
         pyc_extension = PyCExtension(
             name=self.name,
@@ -535,12 +759,42 @@ class NumetaLibrary:
             wrapper_config_function.backend if wrapper_config_function is not None else None
         )
         pyc_extension.set_cache_info(wrapper_compile_flags, backend=wrapper_backend)
+        wrapper_path = directory / f"lib{pyc_extension.name}.so"
+        for function in self._entries.values():
+            existing_wrapper = getattr(function, "_library_pyc_extension", None)
+            if existing_wrapper is None:
+                continue
+            if existing_wrapper.functions != procedures_infos:
+                continue
+            if not existing_wrapper.cache_matches(wrapper_compile_flags, backend=wrapper_backend):
+                continue
+            existing_path = getattr(existing_wrapper, "lib_path", None)
+            if existing_path is not None and Path(existing_path).exists():
+                pyc_extension = existing_wrapper
+                break
+            if wrapper_path.exists():
+                existing_wrapper.set_lib_path(wrapper_path)
+                pyc_extension = existing_wrapper
+                break
         compiler = Compiler("gcc", compile_flags=resolved_flags)
 
         obj_files: set[Path] = set()
         dependencies = {}
+        compiled_artifacts = {}
+        compiled_backends = set()
+        compiled_requires_math = False
+        active_targets = _active_compiled_targets_by_name(
+            self._entries,
+            self._global_entries,
+        )
         pickle_path = directory / f"{self.name}.pkl"
         temp_pickle_path: Path | None = None
+
+        def record_compiled_link_requirements(obj: NumetaCompiledFunction) -> None:
+            nonlocal compiled_requires_math
+            compiled_backends.add(obj.backend)
+            if obj.backend == "c" and getattr(obj, "_requires_math", False):
+                compiled_requires_math = True
 
         def build_function_state(obj: NumetaFunction) -> dict:
             return {
@@ -581,16 +835,28 @@ class NumetaLibrary:
             }
 
         def build_compiled_function_state(obj: NumetaCompiledFunction) -> dict:
-            saved_obj, saved_src, saved_include = _persist_compiled_artifacts(obj, directory)
+            record_compiled_link_requirements(obj)
+            with _timing_phase(
+                timing_callback,
+                "save.persist_artifact",
+                symbol=obj.func_name,
+            ):
+                saved_obj, saved_src, saved_include, artifact = _persist_compiled_artifacts(
+                    obj,
+                    directory,
+                )
+            artifact = {**artifact, "library_name": name}
+            compiled_artifacts[obj.func_name] = artifact
             return {
                 # Loaded functions link against the combined library but keep
                 # func_name as the exported procedure symbol.
-                "name": name,
+                "name": obj.func_name,
+                "library_name": name,
                 "hidden": obj.hidden,
                 "external": obj.external,
                 "_path": directory,
                 "_rpath": directory,
-                "_include": directory,
+                "_include": saved_include,
                 "_obj_files": saved_obj,
                 "_source_files": [saved_src] if saved_src is not None else [],
                 "additional_flags": obj.additional_flags,
@@ -636,6 +902,7 @@ class NumetaLibrary:
                     return (NumetaFunction.__new__, (NumetaFunction,), state)
 
                 if isinstance(obj, NumetaCompiledFunction):
+                    obj = active_targets.get(obj.func_name, obj)
                     state = build_compiled_function_state(obj)
                     obj_files.add(Path(state["_obj_files"]))
                     dependencies |= obj.symbolic_function.get_dependencies()
@@ -644,20 +911,22 @@ class NumetaLibrary:
                 return NotImplemented
 
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=directory,
-                prefix=f".{self.name}.",
-                suffix=".pkl.tmp",
-                delete=False,
-            ) as f:
-                temp_pickle_path = Path(f.name)
-                payload = {
-                    "version": 2,
-                    "entries": list(self._entries.values()),
-                    "global_entries": dict(self._global_entries),
-                }
-                RewritingPickler(f).dump(payload)
+            with _timing_phase(timing_callback, "save.pickle_write"):
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=directory,
+                    prefix=f".{self.name}.",
+                    suffix=".pkl.tmp",
+                    delete=False,
+                ) as f:
+                    temp_pickle_path = Path(f.name)
+                    payload = {
+                        "version": 3,
+                        "entries": list(self._entries.values()),
+                        "global_entries": dict(self._global_entries),
+                        "compiled_artifacts": compiled_artifacts,
+                    }
+                    RewritingPickler(f).dump(payload)
 
             libraries = set()
             libraries_dirs = set()
@@ -665,76 +934,107 @@ class NumetaLibrary:
             include_dirs = set()
             additional_flags = set()
 
-            processed_compiled = set()
-            processed_external = set()
-            pending_dependencies = list(dependencies.values())
+            with _timing_phase(timing_callback, "save.dependency_closure"):
+                processed_compiled = set()
+                processed_external = set()
+                pending_dependencies = list(dependencies.values())
 
-            while pending_dependencies:
-                lib = pending_dependencies.pop()
+                while pending_dependencies:
+                    lib = pending_dependencies.pop()
 
-                if isinstance(lib, NumetaCompiledFunction):
-                    marker = id(lib)
-                    if marker in processed_compiled:
+                    if isinstance(lib, NumetaCompiledFunction):
+                        lib = active_targets.get(lib.func_name, lib)
+                        marker = id(lib)
+                        if marker in processed_compiled:
+                            continue
+                        processed_compiled.add(marker)
+                        record_compiled_link_requirements(lib)
+
+                        with _timing_phase(
+                            timing_callback,
+                            "save.persist_artifact",
+                            symbol=lib.func_name,
+                        ):
+                            saved_obj, _saved_src, _saved_include, artifact = (
+                                _persist_compiled_artifacts(lib, directory)
+                            )
+                        artifact = {**artifact, "library_name": name}
+                        compiled_artifacts[lib.func_name] = artifact
+                        obj_files.add(saved_obj)
+                        pending_dependencies.extend(
+                            lib.symbolic_function.get_dependencies().values()
+                        )
                         continue
-                    processed_compiled.add(marker)
 
-                    saved_obj, _saved_src, _saved_include = _persist_compiled_artifacts(
-                        lib, directory
-                    )
-                    obj_files.add(saved_obj)
-                    pending_dependencies.extend(lib.symbolic_function.get_dependencies().values())
-                    continue
+                    marker = id(lib)
+                    if marker in processed_external:
+                        continue
+                    processed_external.add(marker)
 
-                marker = id(lib)
-                if marker in processed_external:
-                    continue
-                processed_external.add(marker)
+                    if lib.include is not None:
+                        if isinstance(lib.include, (list, tuple, set)):
+                            include_dirs |= set(lib.include)
+                        else:
+                            include_dirs.add(lib.include)
 
-                if lib.include is not None:
-                    if isinstance(lib.include, (list, tuple, set)):
-                        include_dirs |= set(lib.include)
-                    else:
-                        include_dirs.add(lib.include)
+                    if lib.to_link:
+                        libraries.add(getattr(lib, "library_name", lib.name))
+                        if lib.path is not None:
+                            libraries_dirs.add(str(lib.path))
+                        if lib.rpath is not None:
+                            rpath_dirs.add(str(lib.rpath))
 
-                if lib.to_link:
-                    libraries.add(getattr(lib, "library_name", lib.name))
-                    if lib.path is not None:
-                        libraries_dirs.add(str(lib.path))
-                    if lib.rpath is not None:
-                        rpath_dirs.add(str(lib.rpath))
+                    if lib.additional_flags is not None:
+                        if isinstance(lib.additional_flags, str):
+                            additional_flags.add(tuple(lib.additional_flags.split()))
+                        else:
+                            additional_flags.add(tuple(lib.additional_flags))
 
-                if lib.additional_flags is not None:
-                    if isinstance(lib.additional_flags, str):
-                        additional_flags.add(tuple(lib.additional_flags.split()))
-                    else:
-                        additional_flags.add(tuple(lib.additional_flags))
+            if "fortran" in compiled_backends:
+                libraries.update({"gfortran", "m", "mvec"})
+            if compiled_requires_math:
+                libraries.add("m")
 
-            lib = compiler.compile_to_library(
-                name,
-                obj_files,
-                directory,
-                libraries=libraries,
-                include_dirs=include_dirs,
-                libraries_dirs=libraries_dirs,
-                rpath_dirs=rpath_dirs,
-                additional_flags=additional_flags,
-            )
-
-            if procedures_infos:
-                pyc_extension.compile(
-                    core_lib_name=name,
-                    core_lib_path=directory,
-                    directory=directory,
-                    compile_flags=wrapper_compile_flags,
-                    backend=wrapper_backend,
+            with _timing_phase(timing_callback, "save.link", objects=len(obj_files)):
+                lib = compiler.compile_to_library(
+                    name,
+                    obj_files,
+                    directory,
+                    libraries=libraries,
+                    include_dirs=include_dirs,
+                    libraries_dirs=libraries_dirs,
+                    rpath_dirs=rpath_dirs,
+                    additional_flags=additional_flags,
                 )
 
-            os.replace(temp_pickle_path, pickle_path)
+            if procedures_infos:
+                wrapper_reused = (
+                    pyc_extension.lib_path is not None and Path(pyc_extension.lib_path).exists()
+                )
+                with _timing_phase(
+                    timing_callback,
+                    "save.wrapper",
+                    reused=wrapper_reused,
+                ):
+                    if not wrapper_reused:
+                        pyc_extension.compile(
+                            core_lib_name=name,
+                            core_lib_path=directory,
+                            directory=directory,
+                            compile_flags=wrapper_compile_flags,
+                            backend=wrapper_backend,
+                        )
+                for function in self._entries.values():
+                    function._library_pyc_extension = pyc_extension
+
+            with _timing_phase(timing_callback, "save.pickle_commit"):
+                os.replace(temp_pickle_path, pickle_path)
         except Exception:
             if temp_pickle_path is not None:
                 temp_pickle_path.unlink(missing_ok=True)
             raise
 
+        _emit_timing(timing_callback, "save.total", perf_counter() - save_start)
         return lib
 
     @classmethod
@@ -744,11 +1044,22 @@ class NumetaLibrary:
         directory: str | Path,
         *,
         safe: bool = False,
+        ignore_corrupt: bool | None = None,
     ) -> "NumetaLibrary":
+        """Load a persisted library.
+
+        ``ignore_corrupt=True`` treats malformed cache metadata as a cache
+        miss. It does not make pickle deserialization safe for untrusted
+        input. ``safe`` is retained as a compatibility alias.
+        """
+        if ignore_corrupt is not None and safe and ignore_corrupt != safe:
+            raise ValueError("safe and ignore_corrupt specify conflicting values")
+        tolerate_corrupt = safe if ignore_corrupt is None else ignore_corrupt
         cls._nm_validate_name(name)
         directory = Path(directory).absolute()
 
         result = NumetaLibrary(name)
+        compiled_artifacts = {}
 
         try:
             with open(directory / f"{name}.pkl", "rb") as handle:
@@ -757,6 +1068,7 @@ class NumetaLibrary:
             if isinstance(payload, dict) and "entries" in payload:
                 entries = payload["entries"]
                 global_entries = payload.get("global_entries", {})
+                compiled_artifacts = payload.get("compiled_artifacts", {})
             else:
                 entries = payload
                 global_entries = {}
@@ -773,13 +1085,21 @@ class NumetaLibrary:
                 for func in global_entries:
                     result._global_entries[func.func_name] = func
         except (EOFError, pickle.UnpicklingError) as exc:
-            if not safe:
+            if not tolerate_corrupt:
                 raise
             warnings.warn(
                 f"Failed to load NumetaLibrary '{name}' cache from {directory / f'{name}.pkl'}: {exc}. "
                 "Treating it as a cache miss.",
                 RuntimeWarning,
             )
+
+        roots = [
+            compiled
+            for func in result._entries.values()
+            for compiled in func._compiled_functions.values()
+        ]
+        roots.extend(result._global_entries.values())
+        _load_compiled_artifact_graph(directory, roots, compiled_artifacts)
 
         restored_extensions = set()
         for func in result._entries.values():

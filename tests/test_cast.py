@@ -26,7 +26,7 @@ def test_cast(dtype, backend):
 
     @nm.jit(backend=backend)
     def set_nine(a):
-        a_int = nm.cast(a, dtype)
+        a_int = nm.view(a, dtype)
         a_int[:] = 9.0
 
     # should contain everything
@@ -47,7 +47,7 @@ def test_cast_getitem(dtype, backend):
 
     @nm.jit(backend=backend)
     def set_nine(a):
-        a_int = nm.cast(a[0], dtype)
+        a_int = nm.view(a[0], dtype)
         a_int[:] = 9.0
 
     # should contain everything
@@ -69,7 +69,7 @@ def test_cast_struct(backend):
 
     @nm.jit(backend=backend)
     def set_nine(a):
-        a_int = nm.cast(a, dtype)
+        a_int = nm.view(a, dtype)
         a_int["a"][:] = 9.0
         a_int["b"][:] = 9
 
@@ -90,7 +90,7 @@ def test_cast_array_infers_shape_when_itemsize_matches(backend):
 
     @nm.jit(backend=backend)
     def set_all(a):
-        a_view = nm.cast(a, np.float64)
+        a_view = nm.view(a, np.float64)
         a_view[:] = 3.5
 
     a = np.zeros((3, 4), dtype=np.int64)
@@ -102,7 +102,7 @@ def test_cast_array_with_explicit_shape(backend):
 
     @nm.jit(backend=backend)
     def set_two(a):
-        a_view = nm.cast(a, np.float64, shape=(2,))
+        a_view = nm.view(a, np.float64, shape=(2,))
         a_view[:] = 11.0
 
     a = np.zeros(16, dtype=np.bool_)
@@ -114,7 +114,7 @@ def test_cast_array_type_dtype_with_shape_inference(backend):
 
     @nm.jit(backend=backend)
     def set_all(a):
-        a_view = nm.cast(a, nm.float32[:, :])
+        a_view = nm.view(a, nm.float32[:, :])
         a_view[:] = 2.25
 
     a = np.zeros((2, 3), dtype=np.int32)

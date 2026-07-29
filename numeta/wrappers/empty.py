@@ -5,6 +5,7 @@ from numeta.builder_helper import BuilderHelper
 from numeta.datatype import DataType, float64, get_datatype, size_t
 from numeta.array_shape import ArrayShape, SCALAR, UNKNOWN
 from numeta.ast.variable import Variable
+from numeta.settings import settings
 
 
 def empty(
@@ -13,6 +14,7 @@ def empty(
     order: str = "C",
     name: str | None = None,
     force_dynamic_allocation: bool = False,
+    allocation: str = "auto",
 ) -> Variable:
     def normalize_shape_argument(shape_arg):
         if isinstance(shape_arg, ArrayShape):
@@ -41,6 +43,14 @@ def empty(
 
     if order not in ["C", "F"]:
         raise ValueError(f"Invalid order: {order}, must be 'C' or 'F'")
+    if allocation not in {"auto", "stack", "heap"}:
+        raise ValueError("allocation must be 'auto', 'stack', or 'heap'")
+    if force_dynamic_allocation:
+        if allocation != "auto":
+            raise ValueError(
+                "force_dynamic_allocation=True cannot be combined with allocation != 'auto'"
+            )
+        allocation = "heap"
 
     fortran_order = order == "F"
     normalized_shape_arg = normalize_shape_argument(shape)
@@ -53,7 +63,24 @@ def empty(
 
     dtype = get_datatype(dtype)
 
-    allocate = force_dynamic_allocation or shape.has_comptime_undefined_dims()
+    if allocation == "stack" and shape.has_comptime_undefined_dims():
+        try:
+            builder = BuilderHelper.get_current_builder()
+            backend = builder.numeta_function.backend
+        except Exception:
+            backend = None
+        if backend == "c" and not settings.c_allow_vla_temporaries:
+            raise ValueError(
+                "allocation='stack' with runtime dimensions requires "
+                "nm.settings.c_allow_vla_temporaries=True for the C backend"
+            )
+
+    if allocation == "heap":
+        allocate = True
+    elif allocation == "stack":
+        allocate = False
+    else:
+        allocate = shape.has_comptime_undefined_dims()
     array = BuilderHelper.generate_local_variables(
         "fc_a",
         name=name,

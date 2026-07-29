@@ -13,6 +13,7 @@ def zeros(
     order: str = "C",
     name: str | None = None,
     force_dynamic_allocation: bool = False,
+    allocation: str = "auto",
 ) -> Variable:
     array = empty(
         shape,
@@ -20,6 +21,7 @@ def zeros(
         order=order,
         name=name,
         force_dynamic_allocation=force_dynamic_allocation,
+        allocation=allocation,
     )
     array[:] = 0.0
     return array

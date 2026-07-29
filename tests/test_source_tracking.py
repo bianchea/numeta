@@ -405,31 +405,15 @@ def test_variable_captures_source_location():
 # Integration tests with JIT compilation
 
 
-def test_step_slicing_error_shows_user_code_location():
-    """Test that step slicing error points to user's code, not numeta internals."""
+def test_step_slicing_supported_for_positive_step():
+    """Positive step slicing should now lower successfully."""
 
     @jit(backend="c")
     def test_func(arr):
         return arr[::2]  # STEP_SLICING_ERROR_LINE
 
     arr = np.array([1, 2, 3, 4, 5], dtype=np.float64)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        test_func(arr)
-
-    error_msg = str(exc_info.value)
-
-    # Error should mention step slicing
-    assert "step" in error_msg.lower() or "slicing" in error_msg.lower()
-
-    # Error should point to this test file
-    assert "test_source_tracking.py" in error_msg
-
-    # Error should show the actual problematic line
-    assert "STEP_SLICING_ERROR_LINE" in error_msg or "arr[::2]" in error_msg
-
-    # Should NOT point to numeta internal files
-    assert "numeta/ast/expressions/getitem.py" not in error_msg
+    np.testing.assert_equal(test_func(arr), arr[::2])
 
 
 @pytest.mark.parametrize("test_backend", ["c", "fortran"])
@@ -460,20 +444,15 @@ def test_getitem_error_shows_source_across_backends(test_backend):
         (slice(0, 10, 3),),  # Step 3
     ],
 )
-def test_various_step_values_show_source(shape_args):
-    """Test that different step values all show source location."""
+def test_various_positive_step_values(shape_args):
+    """Different positive step values should lower successfully."""
 
     @jit(backend="c")
     def test_func(arr):
         return arr[shape_args[0]]  # VARIOUS_STEP_LINE
 
     arr = np.arange(20, dtype=np.float64)
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        test_func(arr)
-
-    error_msg = str(exc_info.value)
-    assert "test_source_tracking.py" in error_msg
+    np.testing.assert_equal(test_func(arr), arr[shape_args[0]])
 
 
 # Test that source location works through various node types

@@ -8,11 +8,27 @@ from numeta.array_shape import ArrayShape
 from numeta.ast.variable import Variable
 
 
-def constant(value: Any, dtype: Any = None, order: str = "C", name: str | None = None) -> Variable:
+def constant(
+    value: Any,
+    dtype: Any = None,
+    order: str = "C",
+    name: str | None = None,
+    *,
+    static: bool = False,
+) -> Variable:
+    """Create a compile-time constant.
+
+    ``static=True`` gives fixed C arrays static storage duration.  This keeps
+    descriptor tables out of the stack frame and avoids reinitializing them on
+    every generated-kernel call.  It is intentionally limited to C lowering;
+    callers should not request it from a Fortran kernel.
+    """
     if order not in ["C", "F"]:
         raise ValueError(f"Invalid order: {order}, must be 'C' or 'F'")
 
     builder = BuilderHelper.get_current_builder()
+    if static and builder.numeta_function.backend != "c":
+        raise ValueError("nm.constant(static=True) is supported only by the C backend")
 
     # Determine value shape and numpy representation
     if isinstance(value, np.ndarray):
@@ -48,6 +64,8 @@ def constant(value: Any, dtype: Any = None, order: str = "C", name: str | None =
         return builder.generate_local_variables(
             name,
             dtype=dtype,
+            parameter=static,
+            c_static=static,
             # TODO
             # parameter=True, # parameter is not supported yet, so not really constant.
             # parameter=True,
@@ -59,6 +77,8 @@ def constant(value: Any, dtype: Any = None, order: str = "C", name: str | None =
         name,
         dtype=dtype,
         shape=array_shape,
+        parameter=static,
+        c_static=static,
         # TODO
         # parameter=True, # parameter is not supported yet, so not really constant.
         # parameter=True,

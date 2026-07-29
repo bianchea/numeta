@@ -10,7 +10,13 @@ def get_slice_dim(slice_, max_dim):
         stop = max_dim
     if stop is None:
         return None
-    return stop - start + settings.syntax.array_lower_bound
+    span = stop - start + settings.syntax.array_lower_bound
+    step = slice_.step
+    if step is None:
+        return span
+    if isinstance(step, int) and step <= 0:
+        raise NotImplementedError("Negative step slicing is not implemented for shape extraction")
+    return (span + step - 1) // step
 
 
 def merge_slices(base_slice, key):

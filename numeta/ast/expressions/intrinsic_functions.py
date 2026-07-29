@@ -1,5 +1,5 @@
 from numeta.ast.tools import check_node
-from numeta.array_shape import ArrayShape, SCALAR, UNKNOWN
+from numeta.array_shape import ArrayShape, SCALAR
 from numeta.exceptions import raise_with_source
 from .expression_node import ExpressionNode
 
@@ -137,7 +137,7 @@ class Shape(UnaryIntrinsicFunction):
     token = "shape"
 
     def __init__(self, argument):
-        if argument._shape is SCALAR:
+        if argument._shape.is_scalar:
             raise_with_source(
                 ValueError,
                 "The shape intrinsic function cannot be applied to a scalar.",
@@ -154,7 +154,7 @@ class Shape(UnaryIntrinsicFunction):
     @property
     def _shape(self):
         var_shape = self.arguments[0]._shape
-        if var_shape is SCALAR or var_shape is UNKNOWN:
+        if var_shape.is_scalar or var_shape.is_unknown:
             raise_with_source(
                 ValueError,
                 "The shape intrinsic function can only be applied to variables with a defined shape.",
@@ -224,13 +224,13 @@ class Transpose(UnaryIntrinsicFunction):
     @property
     def _shape(self):
         arg_shape = self.arguments[0]._shape
-        if arg_shape is SCALAR:
+        if arg_shape.is_scalar:
             raise_with_source(
                 ValueError,
                 "Cannot transpose a scalar.",
                 source_node=self.arguments[0],
             )
-        if arg_shape is UNKNOWN:
+        if arg_shape.is_unknown:
             raise_with_source(
                 ValueError,
                 "Cannot transpose a variable with unknown shape.",
@@ -248,13 +248,13 @@ class Transpose(UnaryIntrinsicFunction):
 
     @property
     def shape(self):
-        if self.arguments[0]._shape is SCALAR:
+        if self.arguments[0]._shape.is_scalar:
             raise_with_source(
                 ValueError,
                 "Cannot transpose a scalar.",
                 source_node=self.arguments[0],
             )
-        elif self.arguments[0]._shape is UNKNOWN:
+        elif self.arguments[0]._shape.is_unknown:
             raise_with_source(
                 ValueError,
                 "Cannot transpose a variable with unknown shape.",

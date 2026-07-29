@@ -31,6 +31,10 @@ class ArrayShape:
         return self._shape is None
 
     @property
+    def is_scalar(self) -> bool:
+        return isinstance(self._shape, tuple) and len(self._shape) == 0
+
+    @property
     def is_shape_vector(self) -> bool:
         return self._shape is not None and not isinstance(self._shape, tuple)
 
@@ -71,7 +75,7 @@ class ArrayShape:
     def __repr__(self) -> str:
         if self._shape is None:
             return "ArrayShape<unknown>"
-        elif self.rank == 0:
+        elif self.is_scalar:
             return "ArrayShape<scalar>"
         else:
             inner = ", ".join(map(str, self.as_tuple()))

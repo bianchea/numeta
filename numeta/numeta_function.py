@@ -4,6 +4,7 @@ import tempfile
 import warnings
 from typing import Iterable
 import sysconfig
+from dataclasses import dataclass
 
 from .compiler import Compiler
 from .settings import settings
@@ -20,6 +21,17 @@ from .signature import (
     parse_function_parameters,
 )
 from .native_name_registry import native_name_registry
+
+
+@dataclass
+class _GeneratedFunctionState:
+    name: str
+    return_signatures: dict
+    compiled_functions: dict
+    wrapper_specs: dict
+    pyc_extensions: dict
+    library_pyc_extension: object
+    fast_call: dict
 
 
 class NumetaCompiledFunction(ExternalLibrary):
@@ -86,6 +98,26 @@ class NumetaCompiledFunction(ExternalLibrary):
     @library_name.setter
     def library_name(self, value):
         self._library_name = value
+
+    def adopt_compiled_state(self, replacement: "NumetaCompiledFunction") -> None:
+        """Adopt replacement state while preserving this object's identity."""
+        if not isinstance(replacement, NumetaCompiledFunction):
+            raise TypeError("replacement must be a NumetaCompiledFunction")
+
+        self.name = replacement.name
+        self.func_name = replacement.func_name
+        self.symbolic_function = replacement.symbolic_function
+        self.symbolic_function.parent = self
+        self._path = replacement._path
+        self._rpath = replacement._rpath
+        self._include = replacement._include
+        self._obj_files = replacement._obj_files
+        self._source_files = list(getattr(replacement, "_source_files", []))
+        self.do_checks = replacement.do_checks
+        self.compile_flags = replacement.compile_flags
+        self.backend = replacement.backend
+        self._requires_math = getattr(replacement, "_requires_math", False)
+        self.compiled = replacement.compiled
 
     def __setstate__(self, state):
         # Older library pickles stored the aggregate link-library name in
@@ -455,6 +487,30 @@ class NumetaFunction(BaseFunction):
         self._library_pyc_extension = None
         if release_names and released_names:
             native_name_registry.release_many(released_names)
+
+    def snapshot_generated_state(self) -> _GeneratedFunctionState:
+        """Capture mutable generated state for transactional operations."""
+        return _GeneratedFunctionState(
+            name=self.name,
+            return_signatures=self.return_signatures.copy(),
+            compiled_functions=self._compiled_functions.copy(),
+            wrapper_specs=self._wrapper_specs.copy(),
+            pyc_extensions=self._pyc_extensions.copy(),
+            library_pyc_extension=self._library_pyc_extension,
+            fast_call=self._fast_call.copy(),
+        )
+
+    def restore_generated_state(self, state: _GeneratedFunctionState) -> None:
+        """Restore a snapshot returned by :meth:`snapshot_generated_state`."""
+        if not isinstance(state, _GeneratedFunctionState):
+            raise TypeError("state must come from snapshot_generated_state()")
+        self.name = state.name
+        self.return_signatures = state.return_signatures
+        self._compiled_functions = state.compiled_functions
+        self._wrapper_specs = state.wrapper_specs
+        self._pyc_extensions = state.pyc_extensions
+        self._library_pyc_extension = state.library_pyc_extension
+        self._fast_call = state.fast_call
 
     def run_symbolic(self, *args, **kwargs):
         return self._func(*args, **kwargs)

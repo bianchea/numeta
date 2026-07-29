@@ -1,5 +1,7 @@
 import numpy as np
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -273,6 +275,358 @@ def test_library_save_load_preserves_multiple_global_entries(tmp_path, backend):
         assert (code_dir / f"{key}{suffix}").exists()
 
 
+def test_library_replace_global_constant_preserves_dependents(tmp_path, backend):
+    name = f"replace_global_constant_{backend}"
+    lib = nm.NumetaLibrary(name)
+    table_name = f"{name}_table"
+    jit_dir = tmp_path / "jit"
+
+    table = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([2.0]),
+        name=table_name,
+        backend=backend,
+        directory=jit_dir,
+        library=lib,
+    )
+
+    @nm.jit(directory=jit_dir, backend=backend, library=lib)
+    def use_table(out):
+        out[0] = table[0]
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.use_table(out)
+    np.testing.assert_allclose(out, np.array([2.0]))
+
+    old_function_target = next(iter(lib.use_table._compiled_functions.values()))
+    namespace_name = f"{table_name}_namespace"
+    old_global_target = lib._global_entries[namespace_name]
+
+    new_table = lib.replace_global_constant(
+        table_name,
+        value=np.array([5.0]),
+        compile_now=True,
+    )
+
+    assert lib._global_entries[namespace_name] is old_global_target
+    assert old_global_target.symbolic_function.variables[table_name] is new_table
+    assert next(iter(lib.use_table._compiled_functions.values())) is old_function_target
+
+    saved_dir = tmp_path / "saved"
+    lib.save(saved_dir, "")
+    lib_loaded = nm.NumetaLibrary.load(name, saved_dir)
+
+    out = np.zeros(1, dtype=np.float64)
+    lib_loaded.use_table(out)
+    np.testing.assert_allclose(out, np.array([5.0]))
+
+
+def test_library_replace_global_constant_rejects_shape_change_by_default(tmp_path, backend):
+    name = f"replace_global_constant_shape_{backend}"
+    lib = nm.NumetaLibrary(name)
+    table_name = f"{name}_table"
+
+    nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([2.0]),
+        name=table_name,
+        backend=backend,
+        directory=tmp_path,
+        library=lib,
+    )
+
+    with pytest.raises(ValueError, match="changed shape"):
+        lib.replace_global_constant(
+            table_name,
+            shape=(2,),
+            value=np.array([2.0, 3.0]),
+            compile_now=False,
+        )
+
+
+def test_library_clear_generated_state_clears_functions_and_globals(tmp_path, backend):
+    name = f"clear_generated_state_{backend}"
+    lib = nm.NumetaLibrary(name)
+    table_name = f"{name}_table"
+
+    nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([2.0]),
+        name=table_name,
+        backend=backend,
+        directory=tmp_path,
+        library=lib,
+    )
+
+    @nm.jit(backend=backend, library=lib)
+    def fill(scale: nm.comptime, out):
+        out[:] = scale
+
+    array_type = nm.float64[3]
+    lib.fill(1, array_type)
+    lib.fill(2, array_type)
+    first_signature = lib.fill.get_signature(1, array_type)
+    second_signature = lib.fill.get_signature(2, array_type)
+
+    lib.fill.clear_generated_state(signatures=[first_signature])
+    assert first_signature not in lib.fill._compiled_functions
+    assert second_signature in lib.fill._compiled_functions
+
+    lib.clear_generated_state(include_globals=True)
+    assert lib.fill._compiled_functions == {}
+    assert lib.fill._wrapper_specs == {}
+    assert lib.fill.return_signatures == {}
+    assert lib._global_entries == {}
+
+
+def test_library_write_code_emits_dependency_global_after_partial_clear(tmp_path):
+    lib = nm.NumetaLibrary("write_code_dependency_global_after_partial_clear")
+    table = None
+
+    @nm.jit(directory=tmp_path / "jit", backend="fortran", library=lib)
+    def use_table(max_order: nm.comptime, out):
+        out[0] = table[0]
+
+    table = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([7.0]),
+        name="write_code_table_7",
+        backend="fortran",
+        directory=tmp_path / "jit",
+        library=lib,
+    )
+    out = np.zeros(1, dtype=np.float64)
+    lib.use_table(1, out)
+
+    lib._global_entries.clear()
+
+    table = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([11.0]),
+        name="write_code_table_11",
+        backend="fortran",
+        directory=tmp_path / "jit",
+        library=lib,
+    )
+    lib.use_table(2, out)
+
+    code_dir = tmp_path / "code"
+    lib.write_code(code_dir)
+
+    assert (code_dir / "write_code_table_7_namespace_src.f90").exists()
+    assert (code_dir / "write_code_table_11_namespace_src.f90").exists()
+
+
+def test_library_load_uses_nested_artifact_include_for_modules(tmp_path):
+    name = "loaded_artifact_include_fortran"
+    const_name = f"{name}_value"
+    lib = nm.NumetaLibrary(name)
+
+    saved_value = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([3.0]),
+        name=const_name,
+        backend="fortran",
+        library=lib,
+    )
+
+    @nm.jit(backend="fortran", library=lib)
+    def use_saved_value(out):
+        out[0] = saved_value[0]
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.use_saved_value(out)
+    np.testing.assert_allclose(out, np.array([3.0]))
+    lib.save(tmp_path, "")
+
+    lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
+    namespace_compiled = lib_loaded._global_entries[f"{const_name}_namespace"]
+    include_dir = Path(namespace_compiled.include[0])
+    expected_include = (
+        Path(tmp_path).absolute() / "artifacts" / "compiled" / f"{const_name}_namespace"
+    )
+    assert include_dir == expected_include
+    assert (include_dir / f"{const_name}_namespace.mod").exists()
+
+    loaded_value = namespace_compiled.symbolic_function.variables[const_name]
+
+    @nm.jit(directory=tmp_path / "consumer_jit", backend="fortran")
+    def read_loaded_value(out):
+        out[0] = loaded_value[0] + 1.0
+
+    out = np.zeros(1, dtype=np.float64)
+    read_loaded_value(out)
+    np.testing.assert_allclose(out, np.array([4.0]))
+
+
+def test_library_save_loaded_library_includes_dependency_object_closure(tmp_path, monkeypatch):
+    name = "loaded_dependency_closure_fortran"
+    first_name = f"{name}_first"
+    second_name = f"{name}_second"
+    lib = nm.NumetaLibrary(name)
+
+    first = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([2.0]),
+        name=first_name,
+        backend="fortran",
+        library=lib,
+    )
+    second = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([5.0]),
+        name=second_name,
+        backend="fortran",
+        library=lib,
+    )
+
+    @nm.jit(backend="fortran", library=lib)
+    def use_both_values(out):
+        out[0] = first[0] + second[0]
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.use_both_values(out)
+    np.testing.assert_allclose(out, np.array([7.0]))
+    lib.save(tmp_path, "")
+
+    lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
+    required_objects = {
+        Path(next(iter(lib_loaded.use_both_values._compiled_functions.values()))._obj_files).name,
+        Path(lib_loaded._global_entries[f"{first_name}_namespace"]._obj_files).name,
+        Path(lib_loaded._global_entries[f"{second_name}_namespace"]._obj_files).name,
+    }
+
+    original_compile_to_library = Compiler.compile_to_library
+    linked_objects = []
+
+    def record_compile_to_library(self, *args, **kwargs):
+        library_name = args[0] if args else kwargs.get("name")
+        obj_files = args[1] if len(args) > 1 else kwargs.get("src_files")
+        if library_name == name:
+            linked_objects.append({Path(obj).name for obj in obj_files})
+        return original_compile_to_library(self, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "compile_to_library", record_compile_to_library)
+
+    lib_loaded.save(tmp_path, "")
+
+    assert linked_objects
+    assert required_objects <= linked_objects[-1]
+
+
+def test_library_save_moves_root_objects_into_artifacts(tmp_path):
+    name = "save_moves_root_objects_fortran"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(directory=tmp_path, backend="fortran", library=lib)
+    def add_one(out):
+        out[0] += 1.0
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.add_one(out)
+    np.testing.assert_allclose(out, np.array([1.0]))
+
+    compiled = next(iter(lib.add_one._compiled_functions.values()))
+    root_obj = Path(compiled._obj_files)
+    assert root_obj.parent == Path(tmp_path).absolute()
+
+    lib.save(tmp_path, "")
+
+    artifact_obj = Path(compiled._obj_files)
+    assert artifact_obj.parent == (
+        Path(tmp_path).absolute() / "artifacts" / "compiled" / compiled.func_name
+    )
+    assert artifact_obj.exists()
+    assert not root_obj.exists()
+
+    stale_root_obj = Path(tmp_path).absolute() / artifact_obj.name
+    stale_root_obj.write_bytes(artifact_obj.read_bytes())
+    lib.save(tmp_path, "")
+    assert not stale_root_obj.exists()
+
+
+def test_library_artifact_manifest_is_relative_and_relocatable(tmp_path):
+    name = "relative_manifest_fortran"
+    source_dir = tmp_path / "source"
+    relocated_dir = tmp_path / "relocated"
+    const_name = f"{name}_value"
+    lib = nm.NumetaLibrary(name)
+
+    saved_value = nm.declare_global_constant(
+        (1,),
+        np.float64,
+        value=np.array([8.0]),
+        name=const_name,
+        backend="fortran",
+        library=lib,
+    )
+
+    @nm.jit(backend="fortran", library=lib)
+    def use_manifest_value(out):
+        out[0] = saved_value[0]
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.use_manifest_value(out)
+    lib.save(source_dir, "")
+
+    with open(source_dir / f"{name}.pkl", "rb") as handle:
+        payload = pickle.load(handle)
+
+    artifacts = payload["compiled_artifacts"]
+    assert artifacts
+    for artifact in artifacts.values():
+        for key in ("object_files", "source_files", "include_dirs", "module_files"):
+            assert all(not Path(path).is_absolute() for path in artifact[key])
+
+    shutil.copytree(source_dir, relocated_dir)
+    lib_loaded = nm.NumetaLibrary.load(name, relocated_dir)
+    namespace_compiled = lib_loaded._global_entries[f"{const_name}_namespace"]
+    assert Path(namespace_compiled._obj_files).is_relative_to(relocated_dir)
+    assert Path(namespace_compiled._include).is_relative_to(relocated_dir)
+
+    loaded_value = namespace_compiled.symbolic_function.variables[const_name]
+
+    @nm.jit(directory=tmp_path / "relocated_consumer", backend="fortran")
+    def read_relocated_value(out):
+        out[0] = loaded_value[0] + 2.0
+
+    out = np.zeros(1, dtype=np.float64)
+    read_relocated_value(out)
+    np.testing.assert_allclose(out, np.array([10.0]))
+
+
+def test_library_load_manifest_reports_missing_artifact(tmp_path):
+    name = "missing_manifest_artifact_fortran"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(backend="fortran", library=lib)
+    def add_one(out):
+        out[0] += 1.0
+
+    out = np.zeros(1, dtype=np.float64)
+    lib.add_one(out)
+    lib.save(tmp_path, "")
+
+    pickle_path = Path(tmp_path) / f"{name}.pkl"
+    with open(pickle_path, "rb") as handle:
+        payload = pickle.load(handle)
+
+    first_artifact = next(iter(payload["compiled_artifacts"].values()))
+    object_file = Path(tmp_path) / first_artifact["object_files"][0]
+    object_file.unlink()
+
+    with pytest.raises(FileNotFoundError, match="Missing persisted artifact"):
+        nm.NumetaLibrary.load(name, tmp_path)
+
+
 def test_library_name_conflict(tmp_path, backend):
 
     lib = nm.NumetaLibrary(f"name_conflict_{backend}")
@@ -515,6 +869,193 @@ def test_library_replace_selected_signature_error_policy_rejects_subset(backend)
     assert replacement._compiled_functions == {}
 
 
+def test_library_replace_compile_now_false_defaults_to_lazy_fallback(backend):
+    lib, old_func, replacement, first_signature, second_signature, old_symbols = (
+        _make_selected_replace_case("replace_lazy_default", backend)
+    )
+
+    construct_calls = []
+    original_construct = replacement.construct_compiled_target
+
+    def counted_construct(self, signature, *args, **kwargs):
+        construct_calls.append((signature, kwargs.get("forced_name")))
+        return original_construct(signature, *args, **kwargs)
+
+    replacement.construct_compiled_target = MethodType(counted_construct, replacement)
+
+    replaced = lib.replace("fill", replacement, compile_now=False)
+
+    assert replaced is replacement
+    assert construct_calls == []
+    assert set(replaced._compiled_functions) == {first_signature, second_signature}
+    assert (
+        replaced._compiled_functions[first_signature]
+        is old_func._compiled_functions[first_signature]
+    )
+    assert (
+        replaced._compiled_functions[second_signature]
+        is old_func._compiled_functions[second_signature]
+    )
+    assert replaced._compiled_functions[first_signature].func_name == old_symbols[first_signature]
+
+
+def test_library_replace_lazy_can_invalidate_existing_specializations(backend):
+    lib, _old_func, replacement, first_signature, second_signature, old_symbols = (
+        _make_selected_replace_case("replace_lazy_invalidate", backend)
+    )
+
+    replaced = lib.replace(
+        "fill",
+        replacement,
+        compile_now=False,
+        mode="lazy",
+        non_selected="invalidate",
+    )
+
+    assert replaced._compiled_functions == {}
+
+    lib.fill(1, nm.float64[3])
+    assert first_signature in replaced._compiled_functions
+    assert replaced._compiled_functions[first_signature].func_name != old_symbols[first_signature]
+    assert second_signature not in replaced._compiled_functions
+
+
+def test_library_replace_function_relinks_existing_callers(tmp_path, backend):
+    name = f"replace_relinks_callers_{backend}"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(backend=backend, library=lib)
+    def inner(scale: nm.comptime, out):
+        out[:] = scale
+
+    @nm.jit(backend=backend, library=lib)
+    def outer(out):
+        inner(1, out)
+
+    out = np.zeros(3, dtype=np.float64)
+    lib.outer(out)
+    np.testing.assert_allclose(out, np.ones(3))
+
+    signature = next(iter(lib.inner._compiled_functions))
+    old_outer_target = next(iter(lib.outer._compiled_functions.values()))
+
+    @nm.jit(backend=backend)
+    def replacement(scale: nm.comptime, out):
+        out[:] = scale + 10
+
+    lib.replace(
+        "inner",
+        replacement,
+        signatures=[signature],
+        compile_now=True,
+    )
+
+    assert next(iter(lib.outer._compiled_functions.values())) is old_outer_target
+
+    lib.save(tmp_path, "")
+    lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
+
+    out = np.zeros(3, dtype=np.float64)
+    lib_loaded.outer(out)
+    np.testing.assert_allclose(out, np.full(3, 11.0))
+
+
+def test_library_dependency_objects_for_symbol_exports_link_plan(backend):
+    name = f"link_plan_for_symbol_{backend}"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(backend=backend, library=lib)
+    def inner(out):
+        out[:] = 3
+
+    @nm.jit(backend=backend, library=lib)
+    def outer(out):
+        inner(out)
+
+    out = np.zeros(3, dtype=np.float64)
+    lib.outer(out)
+
+    signature = next(iter(lib.outer._compiled_functions))
+    outer_compiled = lib.compiled_function("outer", signature)
+    inner_compiled = next(iter(lib.inner._compiled_functions.values()))
+
+    plan = lib.link_plan_for_symbol("outer", signature)
+
+    assert plan["symbol"] == outer_compiled.func_name
+    assert Path(plan["object_file"]).exists()
+    assert Path(outer_compiled.obj_files[0]) in plan["object_files"]
+    assert Path(inner_compiled.obj_files[0]) in plan["dependency_objects"]
+    assert lib.dependency_objects_for_symbol("outer", signature) == plan["object_files"]
+    assert (
+        lib.dependency_objects_for_symbol(
+            outer_compiled.func_name,
+            include_root=False,
+        )
+        == plan["dependency_objects"]
+    )
+
+
+def test_library_signature_ids_are_stable_and_json_safe(backend):
+    lib = nm.NumetaLibrary(f"signature_ids_{backend}")
+
+    @nm.jit(backend=backend, library=lib)
+    def fill(scale: nm.comptime, out):
+        out[:] = scale
+
+    array_type = nm.float64[3]
+    fill(5, array_type)
+    signature = lib.signature_for_call("fill", 5, array_type)
+
+    signature_id = lib.signature_id("fill", signature)
+
+    assert signature_id.startswith("sig-v1-")
+    assert lib.signature_from_id("fill", signature_id) == signature
+    assert lib.signature_ids("fill") == {signature: signature_id}
+    json.dumps(lib.signature_to_json(signature))
+
+
+def test_library_signature_id_rejects_process_specific_repr():
+    class UnsupportedSignatureValue:
+        pass
+
+    lib = nm.NumetaLibrary("unsupported_signature_value")
+
+    with pytest.raises(TypeError, match="stable signature ID"):
+        lib.signature_to_json((UnsupportedSignatureValue(),))
+
+
+def test_library_signature_json_preserves_mapping_key_types():
+    lib = nm.NumetaLibrary("mapping_signature_value")
+
+    encoded = lib.signature_to_json(({1: "integer", "1": "string"},))
+
+    mapping = encoded["signature"][0]
+    assert mapping["kind"] == "mapping"
+    assert len(mapping["items"]) == 2
+
+
+def test_library_compile_replacement_returns_artifact_without_save(tmp_path, backend):
+    lib, _old_func, replacement, first_signature, _second_signature, old_symbols = (
+        _make_selected_replace_case("compile_replacement_artifact", backend)
+    )
+    events = []
+
+    artifact = lib.compile_replacement(
+        "fill",
+        replacement,
+        signature=first_signature,
+        timing_callback=events.append,
+    )
+
+    assert artifact["function"] == "fill"
+    assert artifact["signature"] == first_signature
+    assert artifact["signature_id"] == lib.signature_id("fill", first_signature)
+    assert artifact["symbol"] == old_symbols[first_signature]
+    assert Path(artifact["object_file"]).exists()
+    assert Path(tmp_path, f"{lib.name}.pkl").exists() is False
+    assert "replace.compile_obj" in {event["phase"] for event in events}
+
+
 def test_library_register_rejects_reserved_name(backend):
     lib = nm.NumetaLibrary(f"public_api_reserved_{backend}")
 
@@ -751,6 +1292,33 @@ def test_library_load_reuses_compatible_aggregate_wrapper(tmp_path, backend, mon
     np.testing.assert_array_equal(vector, np.ones(4, dtype=np.int64))
 
 
+def test_library_save_timing_and_reuses_current_aggregate_wrapper(tmp_path, backend):
+    name = f"save_timing_reuse_wrapper_{backend}"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(backend=backend, library=lib)
+    def add(a):
+        a[:] += 1
+
+    vector = np.zeros(4, dtype=np.int64)
+    lib.add(vector)
+
+    first_events = []
+    lib.save(tmp_path, "", timing_callback=first_events.append)
+
+    second_events = []
+    lib.save(tmp_path, "", timing_callback=second_events.append)
+
+    first_phases = {event["phase"] for event in first_events}
+    assert {"save.link", "save.wrapper", "save.total"} <= first_phases
+    assert [event for event in first_events if event["phase"] == "save.wrapper"][-1][
+        "reused"
+    ] is False
+    assert [event for event in second_events if event["phase"] == "save.wrapper"][-1][
+        "reused"
+    ] is True
+
+
 def test_library_load_recompiles_wrapper_on_cache_info_mismatch(tmp_path, backend, monkeypatch):
     name = f"reuse_wrapper_mismatch_{backend}"
     lib = nm.NumetaLibrary(name)
@@ -951,6 +1519,17 @@ def test_library_safe_load_treats_corrupt_pickle_as_cache_miss(tmp_path, backend
 
     with pytest.warns(RuntimeWarning, match="cache miss"):
         lib = nm.NumetaLibrary.load(name, tmp_path, safe=True)
+
+    assert isinstance(lib, nm.NumetaLibrary)
+    assert len(lib) == 0
+
+
+def test_library_ignore_corrupt_names_cache_miss_behavior(tmp_path):
+    name = "corrupt_cache_explicit_name"
+    (Path(tmp_path) / f"{name}.pkl").write_bytes(b"not a pickle")
+
+    with pytest.warns(RuntimeWarning, match="cache miss"):
+        lib = nm.NumetaLibrary.load(name, tmp_path, ignore_corrupt=True)
 
     assert isinstance(lib, nm.NumetaLibrary)
     assert len(lib) == 0

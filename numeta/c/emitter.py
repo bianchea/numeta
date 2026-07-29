@@ -17,9 +17,12 @@ from numeta.type_rules import is_vector_dtype
 
 from numeta.c.c_syntax import render_expr_blocks
 from numeta.c.simd import helper_name as simd_helper_name
+from numeta.c.simd import DIRECT_INTRINSIC_NAMES
+from numeta.c.simd import INTRINSIC_HELPER_OPS
 from numeta.c.simd import needs_header as simd_needs_header
 from numeta.c.simd import render_helpers as render_simd_helpers
 from numeta.c.simd import render_typedefs as render_simd_typedefs
+from numeta.c.simd import render_direct_intrinsic
 from numeta.simd.target import make_simd_target
 
 from numeta.ir.nodes import (
@@ -48,7 +51,6 @@ from numeta.ir.nodes import (
     IROpaqueExpr,
     IROpaqueStmt,
 )
-
 
 _C_BINARY_OPS = {
     "eq": "==",
@@ -639,21 +641,29 @@ class CEmitter:
             if isinstance(expr, IRIntrinsic):
                 for arg in expr.args:
                     visit_expr(arg)
-                if expr.name == "simd_broadcast":
-                    self._register_simd_helper("broadcast", dtype)
-                elif expr.name == "simd_vload":
-                    self._register_simd_helper("load", dtype)
-                elif expr.name == "simd_vgather":
-                    self._register_simd_helper("gather", dtype)
-                elif expr.name == "simd_fma" and is_vector_dtype(dtype):
-                    self._register_simd_helper("fma", dtype)
+                helper_op = INTRINSIC_HELPER_OPS.get(expr.name)
+                if helper_op is not None:
+                    helper_dtype = (
+                        self._dtype_from_expr(expr.args[0])
+                        if helper_op == "reduce_sum" and expr.args
+                        else dtype
+                    )
+                    if is_vector_dtype(helper_dtype):
+                        self._register_simd_helper(helper_op, helper_dtype)
+                    if helper_op == "fma" and is_vector_dtype(dtype):
+                        for arg in expr.args:
+                            if not self._is_vector_expr(arg):
+                                self._register_simd_helper("broadcast", dtype)
+                elif expr.name in DIRECT_INTRINSIC_NAMES:
+                    self._register_vector_type(dtype)
                     for arg in expr.args:
-                        if not self._is_vector_expr(arg):
-                            self._register_simd_helper("broadcast", dtype)
-                elif expr.name == "simd_reduce_sum" and expr.args:
-                    arg_dtype = self._dtype_from_expr(expr.args[0])
-                    if is_vector_dtype(arg_dtype):
-                        self._register_simd_helper("reduce_sum", arg_dtype)
+                        self._register_vector_type(self._dtype_from_expr(arg))
+                    if expr.name == "simd_fnma" and is_vector_dtype(dtype):
+                        for arg in expr.args:
+                            if not self._is_vector_expr(arg):
+                                self._register_simd_helper("broadcast", dtype)
+                elif expr.name == "floor" and is_vector_dtype(dtype):
+                    self._register_vector_type(dtype)
                 elif expr.name == "sqrt" and is_vector_dtype(dtype):
                     self._register_simd_helper("sqrt", dtype)
                 return
@@ -1281,11 +1291,14 @@ class CEmitter:
         for var in proc.locals:
             shape = var.vtype.shape if var.vtype else None
             ctype = self._map_irvar_to_ctype(var)
+            static_prefix = "static " if var.c_static else ""
             const_prefix = "const " if var.parameter else ""
             if shape is None:
                 if var.pointer:
                     self._register_symbol(CSymbolInfo(name=var.name, ctype=ctype, is_pointer=True))
-                    lines.append(f"{'    ' * indent}{const_prefix}{ctype} *{var.name} = NULL;\n")
+                    lines.append(
+                        f"{'    ' * indent}{static_prefix}{const_prefix}{ctype} *{var.name} = NULL;\n"
+                    )
                 else:
                     self._register_symbol(
                         CSymbolInfo(name=var.name, ctype=ctype, pass_by_value=True)
@@ -1295,7 +1308,9 @@ class CEmitter:
                         init = f" = {self._render_literal(var.assign)}"
                     elif ctype.endswith("*"):
                         init = " = NULL"
-                    lines.append(f"{'    ' * indent}{const_prefix}{ctype} {var.name}{init};\n")
+                    lines.append(
+                        f"{'    ' * indent}{static_prefix}{const_prefix}{ctype} {var.name}{init};\n"
+                    )
                 continue
 
             rank = shape.rank or 1
@@ -1313,7 +1328,7 @@ class CEmitter:
                 is_pointer=bool(var.pointer),
             )
             if var.allocatable or var.pointer or self._shape_dims_values(shape) is None:
-                lines.append(f"{'    ' * indent}{ctype} *{var.name} = NULL;\n")
+                lines.append(f"{'    ' * indent}{static_prefix}{ctype} *{var.name} = NULL;\n")
                 continue
 
             total = self._render_product(dims_exprs)
@@ -1324,7 +1339,9 @@ class CEmitter:
                 flat = var.assign.ravel(order="F" if fortran_order else "C")
                 values = ", ".join(self._render_literal(v) for v in flat)
                 init = f" = {{{values}}}"
-            lines.append(f"{'    ' * indent}{ctype} {var.name}[{total}]{init};\n")
+            lines.append(
+                f"{'    ' * indent}{static_prefix}{const_prefix}{ctype} {var.name}[{total}]{init};\n"
+            )
 
         if lines:
             lines.append("\n")
@@ -2121,6 +2138,16 @@ class CEmitter:
         if isinstance(arg, IRGetItem):
             return f"&({self._render_getitem(arg)})"
         if isinstance(arg, IRGetAttr):
+            shape = arg.vtype.shape if arg.vtype is not None else None
+            rank = getattr(shape, "rank", 0) if shape is not None else 0
+            if rank:
+                # Numeta's generated array ABI is flat, while a C
+                # multidimensional array field decays only one dimension
+                # (for example, T[M][N] decays to T (*)[N]). Address the
+                # first scalar element explicitly so every rank is passed as
+                # T * without relying on incompatible pointer conversions.
+                first_element = self._render_expr(arg) + "[0]" * rank
+                return f"&({first_element})"
             return f"&({self._render_expr(arg)})"
         if isinstance(arg, IRVarRef) and arg.var is not None:
             name = arg.var.name
@@ -2490,8 +2517,13 @@ class CEmitter:
                     loop_var = next(loop_iter, "0")
                     indices.append(self._render_slice_index_for_loop(idx, loop_var, origin=expr))
                 else:
-                    self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
-                    indices.append(self._render_expr_with_slice(cast(IRExpr, idx), loop_vars))
+                    indices.append(
+                        self._render_subscript_index_with_slice(
+                            cast(IRExpr, idx),
+                            loop_vars,
+                            origin=expr,
+                        )
+                    )
             linear = self._linear_index(indices, info["dims_exprs"], info["fortran_order"])
             return f"({base_name})[{linear}]"
         if isinstance(expr, IRGetAttr):
@@ -2532,6 +2564,48 @@ class CEmitter:
                 arg_renderer=lambda arg: self._render_expr_with_slice(arg, loop_vars),
             )
         return self._render_expr(expr)
+
+    def _render_subscript_index_with_slice(
+        self,
+        idx: IRExpr,
+        loop_vars: list[str],
+        *,
+        origin: IRExpr,
+    ) -> str:
+        """Render a scalar index or an elementwise advanced index.
+
+        Array-valued indices are valid while lowering an array expression when
+        they have the same rank as the surrounding elementwise iteration.  In
+        that case the active loop variables select one scalar index value.  A
+        scalar assignment with an array-valued index still follows the normal
+        getitem path and remains an error.
+        """
+        if is_vector_dtype(self._dtype_from_expr(idx)):
+            self._ensure_scalar_subscript_index(idx, origin=origin)
+
+        rank: int | None = None
+        if isinstance(idx, IRVarRef) and idx.var is not None:
+            info = self._array_info_for_name(idx.var.name)
+            if info is not None:
+                rank = int(info.get("rank", 0))
+
+        if rank is None:
+            shape = idx.vtype.shape if idx.vtype is not None else None
+            rank = getattr(shape, "rank", None)
+
+        if rank in (None, 0):
+            self._ensure_scalar_subscript_index(idx, origin=origin)
+            return self._render_expr_with_slice(idx, loop_vars)
+
+        if rank != len(loop_vars):
+            self._raise_with_source(
+                NotImplementedError,
+                "C backend requires an array-valued subscript to match the "
+                f"elementwise assignment rank ({rank} != {len(loop_vars)})",
+                origin=origin,
+            )
+
+        return self._render_expr_with_slice(idx, loop_vars)
 
     def _render_vector_binary(self, expr: IRBinary) -> str:
         vector_dtype = self._dtype_from_expr(expr)
@@ -2707,18 +2781,18 @@ class CEmitter:
                         self._render_dim(dim) for dim in (self._shape_dims_values(shape) or ())
                     ]
                     indices: list[str] = []
-                for idx in expr.indices:
-                    if isinstance(idx, IRSlice):
-                        start_expr = idx.start
-                        if start_expr is None:
-                            indices.append("0")
-                        else:
-                            indices.append(self._render_expr(start_expr))
-                        continue
-                    self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
-                    indices.append(self._render_expr(cast(IRExpr, idx)))
-                linear = self._linear_index(indices, dims_exprs, shape.order == "F")
-                return f"({base_name})[{linear}]"
+                    for idx in expr.indices:
+                        if isinstance(idx, IRSlice):
+                            start_expr = idx.start
+                            if start_expr is None:
+                                indices.append("0")
+                            else:
+                                indices.append(self._render_expr(start_expr))
+                            continue
+                        self._ensure_scalar_subscript_index(cast(IRExpr, idx), origin=expr)
+                        indices.append(self._render_expr(cast(IRExpr, idx)))
+                    linear = self._linear_index(indices, dims_exprs, shape.order == "F")
+                    return f"({base_name})[{linear}]"
             if isinstance(expr.base, IRGetAttr):
                 shape = expr.base.vtype.shape if expr.base.vtype is not None else None
                 if shape is not None and self._shape_dims_values(shape) is not None:
@@ -2996,40 +3070,50 @@ class CEmitter:
         if arg_renderer is None:
             arg_renderer = self._render_expr
         args = [arg_renderer(arg) for arg in expr.args]
-        if name == "simd_broadcast":
+        helper_op = INTRINSIC_HELPER_OPS.get(name)
+        if helper_op == "load":
             vector_dtype = self._dtype_from_expr(expr)
-            helper = simd_helper_name("broadcast", vector_dtype)
-            return f"{helper}({args[0]})"
-        if name == "simd_vload":
-            vector_dtype = self._dtype_from_expr(expr)
-            helper = simd_helper_name("load", vector_dtype)
+            helper = simd_helper_name(helper_op, vector_dtype)
             base = self._render_simd_array_base(expr.args[0] if expr.args else None)
             index = args[1] if len(args) > 1 else "0"
             return f"{helper}({base} + ({index}))"
-        if name == "simd_vgather":
+        if helper_op == "gather":
             vector_dtype = self._dtype_from_expr(expr)
-            helper = simd_helper_name("gather", vector_dtype)
+            helper = simd_helper_name(helper_op, vector_dtype)
             base = self._render_simd_array_base(expr.args[0] if expr.args else None)
             index_base = self._render_simd_index_array_base(
                 expr.args[1] if len(expr.args) > 1 else None
             )
             offset = args[2] if len(args) > 2 else "0"
             return f"{helper}({base} + ({offset}), {index_base})"
-        if name == "simd_fma":
+        if helper_op == "fma":
             vector_dtype = self._dtype_from_expr(expr)
             if is_vector_dtype(vector_dtype):
-                helper = simd_helper_name("fma", vector_dtype)
+                helper = simd_helper_name(helper_op, vector_dtype)
                 rendered_args = [
                     self._render_vector_operand(arg, vector_dtype) for arg in expr.args
                 ]
                 return f"{helper}({', '.join(rendered_args)})"
             return f"(({args[0]}) * ({args[1]}) + ({args[2]}))"
-        if name == "simd_reduce_sum":
+        if helper_op == "reduce_sum":
             if not expr.args:
                 return "0"
             vector_dtype = self._dtype_from_expr(expr.args[0])
-            helper = simd_helper_name("reduce_sum", vector_dtype)
+            helper = simd_helper_name(helper_op, vector_dtype)
             return f"{helper}({args[0]})"
+        if helper_op is not None:
+            vector_dtype = self._dtype_from_expr(expr)
+            helper = simd_helper_name(helper_op, vector_dtype)
+            return f"{helper}({', '.join(args)})"
+        if name in DIRECT_INTRINSIC_NAMES:
+            return self._render_direct_simd_intrinsic(expr, args)
+        if name == "floor" and is_vector_dtype(self._dtype_from_expr(expr)):
+            return render_direct_intrinsic(
+                "simd_floor",
+                args,
+                target=self._simd_target,
+                vector_dtype=self._dtype_from_expr(expr),
+            )
         if name == "sqrt" and is_vector_dtype(self._dtype_from_expr(expr)):
             self._requires_math = True
             vector_dtype = self._dtype_from_expr(expr)
@@ -3212,6 +3296,21 @@ class CEmitter:
         if name == "trailz":
             return f"(({args[0]}) == 0 ? 64 : __builtin_ctzll((unsigned long long)({args[0]})))"
         return f"{name}({', '.join(args)})"
+
+    def _render_direct_simd_intrinsic(self, expr: IRIntrinsic, args: list[str]) -> str:
+        vector_dtype = self._dtype_from_expr(expr)
+        if expr.name == "simd_fnma":
+            args = [self._render_vector_operand(arg, vector_dtype) for arg in expr.args]
+        try:
+            return render_direct_intrinsic(
+                expr.name,
+                args,
+                target=self._simd_target,
+                vector_dtype=vector_dtype,
+                metadata=expr.metadata,
+            )
+        except NotImplementedError as exc:
+            self._raise_with_source(type(exc), str(exc), origin=expr)
 
     def _render_power(self, left: IRExpr | None, right: IRExpr | None, renderer) -> str:
         if isinstance(right, IRLiteral) and isinstance(right.value, (int, np.integer)):

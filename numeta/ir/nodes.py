@@ -47,6 +47,7 @@ class IRVar(IRNode):
     pointer: bool = False
     target: bool = False
     parameter: bool = False
+    c_static: bool = False
     bind_c: bool = False
     assign: object | None = None
     pass_by_value: bool = False

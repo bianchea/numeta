@@ -228,6 +228,7 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             pointer=getattr(var, "pointer", False),
             target=getattr(var, "target", False),
             parameter=getattr(var, "parameter", False),
+            c_static=getattr(var, "c_static", False),
             bind_c=getattr(var, "bind_c", False),
             assign=getattr(var, "assign", None),
             pass_by_value=var.pass_by_value,
@@ -314,6 +315,10 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             metadata = {}
             if token == "simd_vload":
                 metadata["aligned"] = bool(getattr(expr, "aligned", False))
+            elif token == "simd_compare":
+                metadata["predicate"] = expr.predicate
+            elif token == "simd_extract_i32":
+                metadata["lane"] = expr.lane
             return IRIntrinsic(
                 name=token,
                 args=args,
@@ -548,10 +553,13 @@ def _lower_index_value(value, syntax_settings) -> IRExpr | None:
             lowered_arg = _lower_index_value(argument, syntax_settings)
             if lowered_arg is not None:
                 args.append(lowered_arg)
-        return IRIntrinsic(
-            name=getattr(value, "token", ""),
-            args=args,
-        )
+        token = getattr(value, "token", "")
+        metadata = {}
+        if token == "simd_compare":
+            metadata["predicate"] = value.predicate
+        elif token == "simd_extract_i32":
+            metadata["lane"] = value.lane
+        return IRIntrinsic(name=token, args=args, metadata=metadata)
     return IROpaqueExpr(payload=value, source=value)
 
 

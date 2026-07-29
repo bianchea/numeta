@@ -131,3 +131,50 @@ def test_broadcast_scalar(backend):
     a = np.arange(4, dtype=np.float64)
     add_scalar(a, 2.5)
     np.testing.assert_allclose(a, np.arange(4, dtype=np.float64) + 2.5)
+
+
+def _generated_fortran_source(lib, name, signature, directory):
+    lib.write_code(directory)
+    symbol = lib.compiled_symbols(name)[signature]
+    return (directory / f"{symbol}_src.f90").read_text()
+
+
+def test_fortran_scalar_argument_is_not_assumed_size(tmp_path):
+    lib = nm.NumetaLibrary("scalar_argument_not_assumed_size")
+
+    @nm.jit(backend="fortran", library=lib)
+    def fill(n: nm.int64, out):
+        for i in nm.range(n):
+            out[i] = 1.0
+
+    fill(nm.int64, nm.float64[None])
+    signature = lib.signature_for_call("fill", nm.int64, nm.float64[None])
+
+    source = _generated_fortran_source(lib, "fill", signature, tmp_path)
+
+    assert "integer(c_int64_t), intent(in), value :: n" in source
+    assert "dimension(1:*), intent(in), value :: n" not in source
+    assert "dimension(1:*), intent(inout) :: n" not in source
+
+
+def test_fortran_nested_local_scalar_argument_is_not_assumed_size(tmp_path):
+    lib = nm.NumetaLibrary("nested_local_scalar_not_assumed_size")
+
+    @nm.jit(backend="fortran", library=lib, inline=False)
+    def callee(n, out):
+        for i in nm.range(n):
+            out[i] = 2.0
+
+    @nm.jit(backend="fortran", library=lib)
+    def caller(n_in: nm.int64, out):
+        n = nm.empty((), dtype=np.int64, name="n_local_scalar_arg")
+        n[:] = n_in
+        callee(n, out)
+
+    caller(nm.int64, nm.float64[None])
+    signature = lib.signatures("callee")[0]
+
+    source = _generated_fortran_source(lib, "callee", signature, tmp_path)
+
+    assert "integer(c_int64_t), intent(inout) :: n" in source
+    assert "dimension(1:*), intent(inout) :: n" not in source

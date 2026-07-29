@@ -4,7 +4,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from numeta.array_shape import ArrayShape, SCALAR, UNKNOWN
+from numeta.array_shape import ArrayShape
 from numeta.datatype import DataType
 from numeta.exceptions import raise_with_source
 from numeta.ast.statements.tools import print_block
@@ -55,7 +55,6 @@ from numeta.ast.statements.procedure_declaration import (
 from numeta.ast.statements.struct_type_declaration import StructTypeDeclaration
 from numeta.ast.statements.variable_declaration import VariableDeclaration
 from numeta.ast.statements.various import Comment, PointerAssignment, Print, SimpleStatement
-
 
 _C_BINARY_OPS = {
     ".eq.": "==",
@@ -595,9 +594,9 @@ def _render_variable_declaration_blocks(stmt: VariableDeclaration) -> list[str]:
         result = ["const ", *result]
 
     shape = stmt.variable._shape
-    if stmt.variable.allocatable or stmt.variable.pointer or shape is UNKNOWN:
+    if stmt.variable.allocatable or stmt.variable.pointer or shape.is_unknown:
         result += [" *", stmt.variable.name]
-    elif shape is SCALAR:
+    elif shape.is_scalar:
         result += [" ", stmt.variable.name]
     elif shape.rank > 0:
         result += [" ", stmt.variable.name]
@@ -633,7 +632,7 @@ def _render_variable_declaration_blocks(stmt: VariableDeclaration) -> list[str]:
             )
             raise AssertionError("unreachable")
 
-        if stmt.variable._shape is UNKNOWN:
+        if stmt.variable._shape.is_unknown:
             raise_with_source(
                 ValueError,
                 "Cannot assign to a variable with unknown shape. "

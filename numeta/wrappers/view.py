@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any
 
-from numeta.array_shape import ArrayShape, SCALAR
+from numeta.array_shape import ArrayShape
 from numeta.ast.expressions import various as expr_various
 from numeta.builder_helper import BuilderHelper
 from numeta.datatype import ArrayType, get_datatype
@@ -21,7 +21,7 @@ def _normalize_shape_argument(shape_arg: Any, fortran_order: bool) -> ArrayShape
     shape_meta = getattr(shape_arg, "_shape", None)
     if (
         isinstance(shape_meta, ArrayShape)
-        and shape_meta is not SCALAR
+        and not shape_meta.is_scalar
         and not shape_meta.is_unknown
     ):
         if shape_meta.rank != 1:
@@ -76,7 +76,7 @@ def _infer_default_array_shape(variable: Any, src_dtype: Any, dst_dtype: Any) ->
     source_shape = getattr(variable, "_shape", None)
     if not isinstance(source_shape, ArrayShape):
         return None
-    if source_shape is SCALAR or source_shape.is_unknown:
+    if source_shape.is_scalar or source_shape.is_unknown:
         return None
 
     src_bytes = src_dtype.get_nbytes()
@@ -102,7 +102,7 @@ def _infer_default_array_shape(variable: Any, src_dtype: Any, dst_dtype: Any) ->
     return ArrayShape((total_bytes // dst_bytes,), fortran_order=False)
 
 
-def cast(variable: Any, dtype: Any, shape: Any = None) -> Variable:
+def view(variable: Any, dtype: Any, shape: Any = None) -> Variable:
     requested_shape = None
     if isinstance(dtype, ArrayType):
         requested_shape = dtype.shape
@@ -130,7 +130,7 @@ def cast(variable: Any, dtype: Any, shape: Any = None) -> Variable:
         target_shape = BuilderHelper.normalize_allocation_shape(target_shape)
         if _shape_has_unknown_dims(target_shape):
             raise ValueError(
-                "cast() array shape has unresolved dimensions. "
+                "view() array shape has unresolved dimensions. "
                 "Provide an explicit shape with known dimensions."
             )
 

@@ -3,11 +3,113 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from numeta.datatype import _short_c_name, float32, float64, int32, int64
-from numeta.simd.target import SimdTarget
+from numeta.simd.target import (
+    NATIVE_VECTOR_TYPES,
+    X86_ARCHITECTURES,
+    SimdTarget,
+    native_vector_candidates,
+)
+
+SUPPORTED_BASE_DTYPES = frozenset(
+    dtype for arch_types in NATIVE_VECTOR_TYPES.values() for dtype in arch_types
+)
+
+# Intrinsic token -> generated helper operation. Both requirement collection
+# and rendering consume this table, so adding a direct helper intrinsic does
+# not require parallel dispatch edits in the C emitter.
+INTRINSIC_HELPER_OPS = {
+    "simd_broadcast": "broadcast",
+    "simd_vload": "load",
+    "simd_vgather": "gather",
+    "simd_fma": "fma",
+    "simd_reduce_sum": "reduce_sum",
+    "simd_unpack_low": "unpack_low",
+    "simd_unpack_high": "unpack_high",
+    "simd_pairwise_halves_sum": "pairwise_halves_sum",
+}
+
+DIRECT_INTRINSIC_NAMES = frozenset(
+    {
+        "simd_fnma",
+        "simd_cvt_f64_f32",
+        "simd_cvt_f32_f64",
+        "simd_cvt_f64_i32",
+        "simd_cvt_i32_f64",
+        "simd_floor",
+        "simd_rcp",
+        "simd_rsqrt",
+        "simd_compare",
+        "simd_blend",
+        "simd_movemask",
+        "simd_extract_i32",
+        "simd_set4_f64",
+        "simd_exp2_neg_i32",
+    }
+)
+
+_PERMUTE_SECOND_HALVES_IMMEDIATE = 0x21
+_BLEND_UPPER_HALF_IMMEDIATE = 0xC
 
 
-_SUPPORTED_BASE_DTYPES = {float64, float32, int64, int32}
-_X86_ARCHS = {"sse2", "avx", "avx2", "avx512f"}
+def render_direct_intrinsic(
+    name: str,
+    args: list[str],
+    *,
+    target: SimdTarget,
+    vector_dtype=None,
+    metadata: dict | None = None,
+) -> str:
+    """Render a semantic SIMD intrinsic for the selected native target.
+
+    Keeping instruction spelling here prevents the C emitter and public API
+    from depending on AVX names. Additional targets can implement the same
+    semantic operations without changing lowering.
+    """
+    target = _canonical_target(target)
+    if target.arch != "avx2":
+        raise NotImplementedError(f"{name} currently has no {target.arch} implementation")
+    metadata = metadata or {}
+    fixed = {
+        "simd_cvt_f64_f32": "_mm256_cvtpd_ps",
+        "simd_cvt_f32_f64": "_mm256_cvtps_pd",
+        "simd_cvt_f64_i32": "_mm256_cvttpd_epi32",
+        "simd_cvt_i32_f64": "_mm256_cvtepi32_pd",
+        "simd_floor": "_mm256_floor_pd",
+        "simd_rcp": "_mm_rcp_ps",
+        "simd_rsqrt": "_mm_rsqrt_ps",
+        "simd_blend": "_mm256_blendv_pd",
+        "simd_movemask": "_mm256_movemask_pd",
+    }
+    if name in fixed:
+        return f"{fixed[name]}({', '.join(args)})"
+    if name == "simd_fnma":
+        suffix = "pd" if vector_dtype.base_dtype() is float64 else "ps"
+        prefix = "_mm256" if vector_dtype.get_nbytes() == 32 else "_mm"
+        return f"{prefix}_fnmadd_{suffix}({', '.join(args)})"
+    if name == "simd_compare":
+        predicates = {
+            "lt": "_CMP_LT_OQ",
+            "le": "_CMP_LE_OQ",
+            "gt": "_CMP_GT_OQ",
+            "ge": "_CMP_GE_OQ",
+            "eq": "_CMP_EQ_OQ",
+            "neq": "_CMP_NEQ_OQ",
+        }
+        return f"_mm256_cmp_pd({args[0]}, {args[1]}, {predicates[metadata['predicate']]})"
+    if name == "simd_extract_i32":
+        lane = metadata["lane"]
+        if lane == 0:
+            return f"_mm_cvtsi128_si32({args[0]})"
+        return f"_mm_extract_epi32({args[0]}, {lane})"
+    if name == "simd_set4_f64":
+        return f"_mm256_set_pd({args[3]}, {args[2]}, {args[1]}, {args[0]})"
+    if name == "simd_exp2_neg_i32":
+        return (
+            "_mm256_castsi256_pd(_mm256_slli_epi64("
+            "_mm256_sub_epi64(_mm256_set1_epi64x(1023), "
+            f"_mm256_cvtepi32_epi64({args[0]})), 52))"
+        )
+    raise NotImplementedError(f"Unsupported SIMD intrinsic: {name}")
 
 
 @dataclass(frozen=True)
@@ -32,7 +134,7 @@ class LoweredVectorABI:
 
 def vector_abi(vector_dtype, target: SimdTarget) -> LoweredVectorABI:
     base_dtype = vector_dtype.base_dtype()
-    if base_dtype not in _SUPPORTED_BASE_DTYPES:
+    if base_dtype not in SUPPORTED_BASE_DTYPES:
         raise NotImplementedError(f"C SIMD vectors are not supported for dtype {base_dtype}")
 
     target = _canonical_target(target)
@@ -72,19 +174,19 @@ def needs_header(vector_dtypes, target: SimdTarget) -> str | None:
         return None
     if not any(not vector_abi(dtype, target).is_scalar_fallback for dtype in vector_dtypes):
         return None
-    if target.arch in _X86_ARCHS:
+    if target.arch in X86_ARCHITECTURES:
         return "immintrin.h"
     if target.arch == "neon":
         return "arm_neon.h"
     return None
 
 
-def needs_immintrin(vector_dtypes, target: SimdTarget) -> bool:
-    return needs_header(vector_dtypes, target) == "immintrin.h"
-
-
 def helper_name(op: str, vector_dtype) -> str:
-    suffix = _helper_suffix(vector_dtype)
+    return _helper_name_from_parts(op, vector_dtype.base_dtype(), vector_dtype.lanes())
+
+
+def _helper_name_from_parts(op: str, base_dtype, lanes: int) -> str:
+    suffix = f"{_short_c_name(base_dtype)}_{lanes}"
     if op in {"add", "sub", "mul", "div", "fma"}:
         return f"nm_vec_{op}_{suffix}"
     if op == "sqrt":
@@ -99,6 +201,8 @@ def helper_name(op: str, vector_dtype) -> str:
         return f"nm_vstore_{suffix}"
     if op == "reduce_sum":
         return f"nm_reduce_sum_{suffix}"
+    if op in {"unpack_low", "unpack_high", "pairwise_halves_sum"}:
+        return f"nm_{op}_{suffix}"
     raise NotImplementedError(f"Unsupported SIMD helper op: {op}")
 
 
@@ -143,6 +247,9 @@ def render_helpers(vector_dtypes, helper_ops, target: SimdTarget) -> list[str]:
         "sqrt",
         "fma",
         "reduce_sum",
+        "unpack_low",
+        "unpack_high",
+        "pairwise_halves_sum",
     ]
     helper_ops = set(helper_ops)
     for vector_dtype in ordered_types:
@@ -182,56 +289,7 @@ def _scalar_vector_abi(vector_dtype, target: SimdTarget) -> LoweredVectorABI:
 
 
 def _native_candidates(arch: str, base_dtype) -> tuple[tuple[int, str], ...]:
-    if arch == "sse2":
-        if base_dtype is float64:
-            return ((2, "__m128d"),)
-        if base_dtype is float32:
-            return ((4, "__m128"),)
-        if base_dtype is int64:
-            return ((2, "__m128i"),)
-        if base_dtype is int32:
-            return ((4, "__m128i"),)
-    if arch == "avx":
-        if base_dtype is float64:
-            return ((4, "__m256d"), (2, "__m128d"))
-        if base_dtype is float32:
-            return ((8, "__m256"), (4, "__m128"))
-        if base_dtype is int64:
-            return ((2, "__m128i"),)
-        if base_dtype is int32:
-            return ((4, "__m128i"),)
-    if arch == "avx2":
-        if base_dtype is float64:
-            return ((4, "__m256d"), (2, "__m128d"))
-        if base_dtype is float32:
-            return ((8, "__m256"), (4, "__m128"))
-        if base_dtype is int64:
-            return ((4, "__m256i"), (2, "__m128i"))
-        if base_dtype is int32:
-            return ((8, "__m256i"), (4, "__m128i"))
-    if arch == "avx512f":
-        if base_dtype is float64:
-            return ((8, "__m512d"), (4, "__m256d"), (2, "__m128d"))
-        if base_dtype is float32:
-            return ((16, "__m512"), (8, "__m256"), (4, "__m128"))
-        if base_dtype is int64:
-            return ((8, "__m512i"), (4, "__m256i"), (2, "__m128i"))
-        if base_dtype is int32:
-            return ((16, "__m512i"), (8, "__m256i"), (4, "__m128i"))
-    if arch == "neon":
-        if base_dtype is float64:
-            return ((2, "float64x2_t"),)
-        if base_dtype is float32:
-            return ((4, "float32x4_t"),)
-        if base_dtype is int64:
-            return ((2, "int64x2_t"),)
-        if base_dtype is int32:
-            return ((4, "int32x4_t"),)
-    raise NotImplementedError(f"Unsupported SIMD architecture: {arch}")
-
-
-def _helper_suffix(vector_dtype) -> str:
-    return f"{_short_c_name(vector_dtype.base_dtype())}_{vector_dtype.lanes()}"
+    return native_vector_candidates(base_dtype, arch)
 
 
 def _render_helper(op: str, abi: LoweredVectorABI) -> list[str]:
@@ -251,11 +309,13 @@ def _render_helper(op: str, abi: LoweredVectorABI) -> list[str]:
         return _render_store_helper(abi)
     if op == "reduce_sum":
         return _render_reduce_sum_helper(abi)
+    if op in {"unpack_low", "unpack_high", "pairwise_halves_sum"}:
+        return _render_lane_permute_helper(op, abi)
     raise NotImplementedError(f"Unsupported SIMD helper op: {op}")
 
 
 def _render_binary_helper(op: str, abi: LoweredVectorABI) -> list[str]:
-    name = helper_name(op, _dtype_from_abi(abi))
+    name = _abi_helper_name(op, abi)
     lines = [f"static inline {abi.c_name} {name}({abi.c_name} a, {abi.c_name} b) {{\n"]
     if abi.is_scalar_fallback or not _has_native_binary(op, abi):
         lines.extend(_render_scalarized_binary_body(op, abi))
@@ -270,7 +330,7 @@ def _render_binary_helper(op: str, abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_sqrt_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("sqrt", _dtype_from_abi(abi))
+    name = _abi_helper_name("sqrt", abi)
     lines = [f"static inline {abi.c_name} {name}({abi.c_name} a) {{\n"]
     if abi.is_scalar_fallback or not _has_native_sqrt(abi):
         lines.extend(_render_scalarized_sqrt_body(abi))
@@ -285,7 +345,7 @@ def _render_sqrt_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_fma_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("fma", _dtype_from_abi(abi))
+    name = _abi_helper_name("fma", abi)
     lines = [
         f"static inline {abi.c_name} {name}({abi.c_name} a, {abi.c_name} b, {abi.c_name} c) {{\n"
     ]
@@ -316,7 +376,7 @@ def _render_fma_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_broadcast_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("broadcast", _dtype_from_abi(abi))
+    name = _abi_helper_name("broadcast", abi)
     lines = [f"static inline {abi.c_name} {name}({abi.base_ctype} x) {{\n"]
     if abi.is_scalar_fallback:
         lines.append(f"    {abi.c_name} out;\n")
@@ -334,7 +394,7 @@ def _render_broadcast_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_load_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("load", _dtype_from_abi(abi))
+    name = _abi_helper_name("load", abi)
     lines = [f"static inline {abi.c_name} {name}(const {abi.base_ctype} *p) {{\n"]
     if abi.is_scalar_fallback:
         lines.append(f"    {abi.c_name} out;\n")
@@ -349,7 +409,7 @@ def _render_load_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_gather_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("gather", _dtype_from_abi(abi))
+    name = _abi_helper_name("gather", abi)
     lines = [
         f"static inline {abi.c_name} {name}(const {abi.base_ctype} *p, const npy_int64 *idx) {{\n"
     ]
@@ -376,7 +436,7 @@ def _render_gather_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_store_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("store", _dtype_from_abi(abi))
+    name = _abi_helper_name("store", abi)
     lines = [f"static inline void {name}({abi.base_ctype} *p, {abi.c_name} v) {{\n"]
     if abi.is_scalar_fallback:
         lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
@@ -389,7 +449,7 @@ def _render_store_helper(abi: LoweredVectorABI) -> list[str]:
 
 
 def _render_reduce_sum_helper(abi: LoweredVectorABI) -> list[str]:
-    name = helper_name("reduce_sum", _dtype_from_abi(abi))
+    name = _abi_helper_name("reduce_sum", abi)
     lines = [f"static inline {abi.base_ctype} {name}({abi.c_name} v) {{\n"]
     if abi.is_scalar_fallback:
         lines.append(f"    {abi.base_ctype} acc = ({abi.base_ctype})0;\n")
@@ -406,58 +466,115 @@ def _render_reduce_sum_helper(abi: LoweredVectorABI) -> list[str]:
     return lines
 
 
+def _render_lane_permute_helper(op: str, abi: LoweredVectorABI) -> list[str]:
+    name = _abi_helper_name(op, abi)
+    lines = [f"static inline {abi.c_name} {name}({abi.c_name} a, {abi.c_name} b) {{\n"]
+    if abi.is_single_native and abi.native_type == "__m256d" and abi.lanes == 4:
+        if op == "unpack_low":
+            lines.append("    return _mm256_unpacklo_pd(a, b);\n")
+        elif op == "unpack_high":
+            lines.append("    return _mm256_unpackhi_pd(a, b);\n")
+        else:
+            lines.append(
+                "    // Select a's upper half followed by b's lower half.\n"
+                f"    __m256d p = _mm256_permute2f128_pd("
+                f"a, b, 0x{_PERMUTE_SECOND_HALVES_IMMEDIATE:X});\n"
+            )
+            lines.append(
+                "    // Keep a's lower half and b's upper half before adding.\n"
+                f"    return _mm256_add_pd("
+                f"p, _mm256_blend_pd(a, b, 0x{_BLEND_UPPER_HALF_IMMEDIATE:X}));\n"
+            )
+    else:
+        if abi.is_scalar_fallback:
+            lines.append(f"    {abi.c_name} out;\n")
+            a_lane = "a.lane"
+            b_lane = "b.lane"
+            out_lane = "out.lane"
+        else:
+            lines.extend(_native_inputs_to_arrays(abi, ("a", "b")))
+            lines.append(f"    {abi.base_ctype} out_tmp[{abi.lanes}];\n")
+            a_lane = "a_tmp"
+            b_lane = "b_tmp"
+            out_lane = "out_tmp"
+        half = abi.lanes // 2
+        if abi.lanes % 2:
+            raise NotImplementedError(f"{op} requires an even SIMD lane count")
+        if op in {"unpack_low", "unpack_high"}:
+            offset = 0 if op == "unpack_low" else 1
+            for pair in range(half):
+                source = 2 * pair + offset
+                lines.append(f"    {out_lane}[{2 * pair}] = {a_lane}[{source}];\n")
+                lines.append(f"    {out_lane}[{2 * pair + 1}] = {b_lane}[{source}];\n")
+        else:
+            for lane in range(half):
+                lines.append(
+                    f"    {out_lane}[{lane}] = {a_lane}[{lane}] + {a_lane}[{lane + half}];\n"
+                )
+                lines.append(
+                    f"    {out_lane}[{lane + half}] = {b_lane}[{lane}] + {b_lane}[{lane + half}];\n"
+                )
+        if abi.is_scalar_fallback:
+            lines.append("    return out;\n")
+        else:
+            lines.append(f"    return {_load_full_expr('out_tmp', abi)};\n")
+    lines.append("}\n")
+    return lines
+
+
 def _render_scalarized_binary_body(op: str, abi: LoweredVectorABI) -> list[str]:
     c_op = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[op]
-    if abi.is_scalar_fallback:
-        lines = [f"    {abi.c_name} out;\n"]
-        lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-        lines.append(f"        out.lane[i] = a.lane[i] {c_op} b.lane[i];\n")
-        lines.append("    }\n")
-        lines.append("    return out;\n")
-        return lines
-
-    lines = _native_inputs_to_arrays(abi, ("a", "b"))
-    lines.append(f"    {abi.base_ctype} out_tmp[{abi.lanes}];\n")
-    lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-    lines.append(f"        out_tmp[i] = a_tmp[i] {c_op} b_tmp[i];\n")
-    lines.append("    }\n")
-    lines.append(f"    return {_load_full_expr('out_tmp', abi)};\n")
-    return lines
+    return _render_scalarized_elementwise_body(
+        abi,
+        ("a", "b"),
+        lambda lane: f"{lane('a')} {c_op} {lane('b')}",
+    )
 
 
 def _render_scalarized_sqrt_body(abi: LoweredVectorABI) -> list[str]:
-    if abi.is_scalar_fallback:
-        lines = [f"    {abi.c_name} out;\n"]
-        lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-        lines.append(f"        out.lane[i] = {_sqrt_call('a.lane[i]', abi.base_dtype)};\n")
-        lines.append("    }\n")
-        lines.append("    return out;\n")
-        return lines
-
-    lines = _native_inputs_to_arrays(abi, ("a",))
-    lines.append(f"    {abi.base_ctype} out_tmp[{abi.lanes}];\n")
-    lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-    lines.append(f"        out_tmp[i] = {_sqrt_call('a_tmp[i]', abi.base_dtype)};\n")
-    lines.append("    }\n")
-    lines.append(f"    return {_load_full_expr('out_tmp', abi)};\n")
-    return lines
+    return _render_scalarized_elementwise_body(
+        abi,
+        ("a",),
+        lambda lane: _sqrt_call(lane("a"), abi.base_dtype),
+    )
 
 
 def _render_scalarized_fma_body(abi: LoweredVectorABI) -> list[str]:
+    return _render_scalarized_elementwise_body(
+        abi,
+        ("a", "b", "c"),
+        lambda lane: f"{lane('a')} * {lane('b')} + {lane('c')}",
+    )
+
+
+def _render_scalarized_elementwise_body(
+    abi: LoweredVectorABI,
+    input_names: tuple[str, ...],
+    expression,
+) -> list[str]:
+    """Render the common unpack/loop/repack shape of scalarized helpers."""
     if abi.is_scalar_fallback:
         lines = [f"    {abi.c_name} out;\n"]
-        lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-        lines.append("        out.lane[i] = a.lane[i] * b.lane[i] + c.lane[i];\n")
-        lines.append("    }\n")
-        lines.append("    return out;\n")
-        return lines
 
-    lines = _native_inputs_to_arrays(abi, ("a", "b", "c"))
-    lines.append(f"    {abi.base_ctype} out_tmp[{abi.lanes}];\n")
+        def lane(name):
+            return f"{name}.lane[i]"
+
+        output = "out.lane[i]"
+        result = "out"
+    else:
+        lines = _native_inputs_to_arrays(abi, input_names)
+        lines.append(f"    {abi.base_ctype} out_tmp[{abi.lanes}];\n")
+
+        def lane(name):
+            return f"{name}_tmp[i]"
+
+        output = "out_tmp[i]"
+        result = _load_full_expr("out_tmp", abi)
+
     lines.append(f"    for (int i = 0; i < {abi.lanes}; ++i) {{\n")
-    lines.append("        out_tmp[i] = a_tmp[i] * b_tmp[i] + c_tmp[i];\n")
+    lines.append(f"        {output} = {expression(lane)};\n")
     lines.append("    }\n")
-    lines.append(f"    return {_load_full_expr('out_tmp', abi)};\n")
+    lines.append(f"    return {result};\n")
     return lines
 
 
@@ -486,17 +603,8 @@ def _native_inputs_to_arrays(abi: LoweredVectorABI, names: tuple[str, ...]) -> l
     return lines
 
 
-def _dtype_from_abi(abi: LoweredVectorABI):
-    class _VectorDtypeAdapter:
-        @staticmethod
-        def base_dtype():
-            return abi.base_dtype
-
-        @staticmethod
-        def lanes():
-            return abi.lanes
-
-    return _VectorDtypeAdapter
+def _abi_helper_name(op: str, abi: LoweredVectorABI) -> str:
+    return _helper_name_from_parts(op, abi.base_dtype, abi.lanes)
 
 
 def _chunk_abi(abi: LoweredVectorABI) -> LoweredVectorABI:
@@ -515,7 +623,7 @@ def _chunk_abi(abi: LoweredVectorABI) -> LoweredVectorABI:
 def _has_native_binary(op: str, abi: LoweredVectorABI) -> bool:
     if abi.is_scalar_fallback:
         return False
-    if abi.target.arch in _X86_ARCHS:
+    if abi.target.arch in X86_ARCHITECTURES:
         if abi.base_dtype in {float64, float32}:
             return op in {"add", "sub", "mul", "div"}
         if op in {"add", "sub"}:
@@ -674,6 +782,7 @@ def _render_native_gather_return(
     result_name: str | None = None,
 ) -> list[str]:
     lines: list[str] = []
+    scale = abi.base_dtype.get_nbytes()
     assign = f"{abi.native_type} {result_name} = " if result_name is not None else "return "
     vidx_name = f"vidx_{result_name}" if result_name is not None else "vidx"
     if abi.native_type == "__m128d" and abi.base_dtype is float64:
@@ -686,24 +795,26 @@ def _render_native_gather_return(
         lines.append(
             f"{indent}__m256i {vidx_name} = _mm256_loadu_si256((const __m256i*)({idx}));\n"
         )
-        lines.append(f"{indent}{assign}_mm256_i64gather_pd({ptr}, {vidx_name}, 8);\n")
+        lines.append(f"{indent}{assign}_mm256_i64gather_pd({ptr}, {vidx_name}, {scale});\n")
         return lines
     if abi.native_type == "__m256i" and abi.base_dtype is int64:
         lines.append(
             f"{indent}__m256i {vidx_name} = _mm256_loadu_si256((const __m256i*)({idx}));\n"
         )
         lines.append(
-            f"{indent}{assign}_mm256_i64gather_epi64((const long long*)({ptr}), {vidx_name}, 8);\n"
+            f"{indent}{assign}_mm256_i64gather_epi64("
+            f"(const long long*)({ptr}), {vidx_name}, {scale});\n"
         )
         return lines
     if abi.native_type == "__m512d" and abi.base_dtype is float64:
         lines.append(f"{indent}__m512i {vidx_name} = _mm512_loadu_si512((const void*)({idx}));\n")
-        lines.append(f"{indent}{assign}_mm512_i64gather_pd({vidx_name}, {ptr}, 8);\n")
+        lines.append(f"{indent}{assign}_mm512_i64gather_pd({vidx_name}, {ptr}, {scale});\n")
         return lines
     if abi.native_type == "__m512i" and abi.base_dtype is int64:
         lines.append(f"{indent}__m512i {vidx_name} = _mm512_loadu_si512((const void*)({idx}));\n")
         lines.append(
-            f"{indent}{assign}_mm512_i64gather_epi64({vidx_name}, (const long long*)({ptr}), 8);\n"
+            f"{indent}{assign}_mm512_i64gather_epi64("
+            f"{vidx_name}, (const long long*)({ptr}), {scale});\n"
         )
         return lines
     raise NotImplementedError(

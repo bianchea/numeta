@@ -63,15 +63,26 @@ in one backend than the other.
 
 ## Installation
 
-To install numeta, use:
+Numeta 0.6 supports Linux on x86-64. Install it with:
 
 ```bash
 git clone https://gitlab.com/andrea_bianchi/numeta
 cd numeta
-pip install .
+python -m pip install .
 ```
 
-You will need a Fortran compiler (only `gfortran` is currently supported) available on your `PATH` for the Fortran backend, or a C compiler (`gcc`) for the C backend.
+All executable kernels require a C compiler (`gcc` by default) for the CPython
+wrapper. The default Fortran backend additionally requires `gfortran`; the C
+backend does not. The packaged `_signature` extension accelerates dispatch, but
+Numeta falls back to its Python parser if an optional extension build is unavailable.
+
+Compiler discovery uses an explicit setting first, then `NUMETA_CC` or `NUMETA_FC`,
+then `gcc` or `gfortran` on `PATH`:
+
+```python
+nm.settings.set_c_compiler("clang")
+nm.settings.set_fortran_compiler("/opt/gcc/bin/gfortran")
+```
 
 ## Quick Start
 
@@ -138,6 +149,18 @@ Numeta supports two code generation backends:
 
 - `fortran` (default)
 - `c`
+
+| Capability | Fortran | C |
+| --- | --- | --- |
+| Scalar and NumPy array kernels | Supported | Supported |
+| Compile-time specialization | Supported | Supported |
+| OpenMP `prange` | Supported | Supported |
+| Persistent native libraries | Supported | Supported |
+| Explicit pointers and C attributes | No | Supported |
+| SIMD vector intrinsics | No | Supported |
+
+Unsupported syntax raises a source-aware error during symbolic generation or
+backend lowering; Numeta does not silently execute unsupported statements as Python.
 
 Pick per function:
 
@@ -305,10 +328,10 @@ Use explicit indexed or sliced targets when you want the operation to appear in
 the generated code.
 
 Use `NumetaLibrary` to group multiple jitted functions and save or load them as a
-unit. It keeps compiled code, dependencies, and wrappers together. Functions can be
-accessed as attributes or via indexing if the function name might conflict with a
-method name. Loading a library restores compiled code so you can cache across
-executions.
+unit. `save("./build")` writes a self-contained `./build/<name>.numeta/` directory
+with a JSON manifest, generated sources, native objects, shared libraries, and
+SHA-256 checksums. Functions can be accessed as attributes or via indexing if their
+names conflict with library methods.
 
 ```python
 import numeta as nm
@@ -339,6 +362,13 @@ array = np.zeros(4, dtype=np.int64)
 lib_loaded.add(array)
 lib_loaded["add"](array)
 ```
+
+Bundles contain trusted executable code and must only be loaded from trusted
+sources. They are intentionally native and strict: Numeta validates Linux machine
+architecture, Python SOABI, NumPy C ABI, wrapper ABI, shared-library availability,
+checksums, and CPU features when `-march=native` was used. Rebuild the bundle after
+an environment mismatch. Pickle libraries from Numeta 0.5 and earlier are never
+deserialized and must be rebuilt from source.
 
 Loaded libraries can also incrementally replace already-compiled specializations.
 The replacement keeps the old exported symbol names, recompiles only the live
@@ -656,9 +686,29 @@ I chose to use Fortran as the default backend for numeta because:
 
 While Fortran has some limitations, it allowed me to create a working prototype quickly. The C backend is also supported and can be selected when desired. I'm open to improving the generated code in both backends, so suggestions are welcome.
 
+## Upgrading to 0.6
+
+Version 0.6 replaces pickle persistence with `.numeta` bundles. Rebuild existing
+saved libraries; automatic conversion is intentionally unavailable. `_signature`
+is now built by the packaging backend rather than during import, and compiler
+selection is configurable through settings or environment variables.
+
 ## Contributing
 
 Contributions are welcome! If you'd like to contribute, please open an issue or submit a pull request.
+
+Install development tools with `python -m pip install -e ".[dev]"`. Run
+`pytest -v --backend=c` and `pytest -v --backend=fortran` independently, then run
+`black --check numeta tests setup.py`. See `AGENTS.md` for repository conventions.
+
+## Troubleshooting
+
+- `ToolchainNotFoundError`: install the required compiler or configure
+  `NUMETA_CC`/`NUMETA_FC`.
+- `CompilationError`: inspect its `command`, `cwd`, `stdout`, and `stderr` fields.
+- `IncompatibleLibraryError`: rebuild the `.numeta` bundle on the current machine.
+- `CorruptLibraryError`: remove or regenerate the bundle; a checksum or manifest
+  validation failed.
 
 ## License
 

@@ -1,9 +1,10 @@
 import sys
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
 from types import MappingProxyType
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 import warnings
 
 from .library_linking import (
@@ -24,6 +25,9 @@ from .native_name_registry import native_name_registry
 from .numeta_function import NumetaCompiledFunction, NumetaFunction
 from .pyc_extension import PyCExtension
 from .settings import settings
+
+if TYPE_CHECKING:
+    from .build_report import NumetaBuildReport
 
 
 def _emit_timing(timing_callback, phase: str, elapsed_s: float, **metadata) -> None:
@@ -53,6 +57,7 @@ class NumetaLibrary:
         "register",
         "remove",
         "replace",
+        "build",
         "replace_global_constant",
         "clear_generated_state",
         "list_functions",
@@ -634,6 +639,174 @@ class NumetaLibrary:
 
         for compiled_target in compiled_targets:
             compiled_target.write_source(directory)
+
+    @staticmethod
+    def _normalize_build_invocation(function_name: str, index: int, invocation):
+        context = f"specializations[{function_name!r}][{index}]"
+        if isinstance(invocation, Mapping):
+            unexpected = set(invocation).difference({"args", "kwargs"})
+            if unexpected:
+                raise ValueError(
+                    f"{context} has unsupported keys: {', '.join(sorted(map(str, unexpected)))}"
+                )
+            args = invocation.get("args", ())
+            kwargs = invocation.get("kwargs", {})
+        elif isinstance(invocation, (tuple, list)):
+            args = invocation
+            kwargs = {}
+        else:
+            raise TypeError(
+                f"{context} must be a positional argument tuple/list or an "
+                "{'args': ..., 'kwargs': ...} mapping"
+            )
+
+        if not isinstance(args, (tuple, list)):
+            raise TypeError(f"{context}['args'] must be a tuple or list")
+        if not isinstance(kwargs, Mapping):
+            raise TypeError(f"{context}['kwargs'] must be a mapping")
+        if not all(isinstance(key, str) for key in kwargs):
+            raise TypeError(f"{context}['kwargs'] keys must be strings")
+        return tuple(args), dict(kwargs)
+
+    def build(
+        self,
+        directory: str | Path,
+        specializations: Mapping[str, Iterable],
+        compile_flags: str | Iterable[str] | None = None,
+        timing_callback=None,
+    ) -> "NumetaBuildReport":
+        """Build requested signatures into one validated native bundle.
+
+        Each mapping value is an iterable of positional argument tuples. Use an
+        ``{"args": (...), "kwargs": {...}}`` entry when a call needs keyword
+        arguments. Requested signatures are constructed without being executed.
+        """
+        from .build_report import NumetaBuildReport
+
+        build_start = perf_counter()
+        if self.name is None:
+            raise ValueError("Library name must be set before building")
+        if not isinstance(specializations, Mapping):
+            raise TypeError("specializations must be a mapping of function names to calls")
+        if not specializations:
+            raise ValueError("specializations must request at least one function")
+
+        requested_names = tuple(specializations)
+        if not all(isinstance(name, str) for name in requested_names):
+            raise TypeError("specialization function names must be strings")
+        unknown_names = [name for name in requested_names if name not in self._entries]
+        if unknown_names:
+            raise KeyError(f"Unknown library function(s): {', '.join(map(repr, unknown_names))}")
+
+        validated = []
+        seen = set()
+        with _timing_phase(timing_callback, "build.validate"):
+            for name in requested_names:
+                calls = specializations[name]
+                if isinstance(calls, (str, bytes, Mapping)):
+                    raise TypeError(
+                        f"specializations[{name!r}] must be an iterable of call specifications"
+                    )
+                try:
+                    calls = tuple(calls)
+                except TypeError as exc:
+                    raise TypeError(
+                        f"specializations[{name!r}] must be an iterable of call specifications"
+                    ) from exc
+                if not calls:
+                    raise ValueError(f"specializations[{name!r}] must not be empty")
+
+                function = self._entries[name]
+                for index, invocation in enumerate(calls):
+                    args, kwargs = self._normalize_build_invocation(name, index, invocation)
+                    signature = function._normalize_specialization_signature(
+                        function.get_signature(*args, **kwargs)
+                    )
+                    try:
+                        hash(signature)
+                    except TypeError as exc:
+                        raise TypeError(
+                            f"{name!r} build signature contains an unhashable value"
+                        ) from exc
+                    stable_id = _signature_id(signature)
+                    key = (name, signature)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if signature not in function._compiled_functions and function._func is None:
+                        raise RuntimeError(
+                            f"Function {name!r} was loaded without its Python body and cannot "
+                            "create a new specialization. Reattach it with @nm.jit(..., "
+                            "library=library, reattach=True) first."
+                        )
+                    validated.append((name, function, signature, stable_id))
+
+        snapshots = {
+            function: function.snapshot_generated_state() for function in self._entries.values()
+        }
+        requested = []
+        created = []
+        reused = []
+
+        try:
+            for name, function, signature, stable_id in validated:
+                is_new = signature not in function._compiled_functions
+                with _timing_phase(
+                    timing_callback,
+                    "build.specialize",
+                    function=name,
+                    signature_id=stable_id,
+                    created=is_new,
+                ):
+                    if is_new:
+                        function.construct_compiled_target(signature)
+                    function.construct_wrapper_spec(signature)
+                    specialization = function.get_specialization(signature)
+                requested.append(specialization)
+                (created if is_new else reused).append(specialization)
+
+            core_library_path = self.save(
+                directory,
+                compile_flags=compile_flags,
+                timing_callback=timing_callback,
+            )
+        except Exception:
+            added_names = []
+            for function, snapshot in snapshots.items():
+                added_names.extend(
+                    compiled.func_name
+                    for signature, compiled in function._compiled_functions.items()
+                    if signature not in snapshot.compiled_functions
+                )
+                function.restore_generated_state(snapshot)
+            native_name_registry.release_many(added_names)
+            raise
+
+        core_library_path = Path(core_library_path)
+        wrapper_path = requested[0].wrapper_path
+        if wrapper_path is None:
+            raise RuntimeError("Batch build completed without producing a Python wrapper")
+        elapsed_s = perf_counter() - build_start
+        report = NumetaBuildReport(
+            library_name=self.name,
+            bundle_path=core_library_path.parent.parent,
+            core_library_path=core_library_path,
+            wrapper_path=wrapper_path,
+            specializations=tuple(requested),
+            created_specializations=tuple(created),
+            reused_specializations=tuple(reused),
+            elapsed_s=elapsed_s,
+        )
+        _emit_timing(
+            timing_callback,
+            "build.total",
+            elapsed_s,
+            functions=len(report.function_names),
+            specializations=report.specialization_count,
+            created=report.created_count,
+            reused=report.reused_count,
+        )
+        return report
 
     def save(
         self,

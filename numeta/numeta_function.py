@@ -994,28 +994,36 @@ class NumetaFunction(BaseFunction):
             raise ValueError(
                 f"Compiled function name '{name}' conflicts with a loaded NumetaLibrary."
             )
+        name_was_reserved = native_name_registry.is_reserved(name)
         native_name_registry.reserve(name)
 
-        symbolic_fun = self.get_symbolic_function(name, signature)
-        symbolic_fun.c_attributes = self.c_attributes
-        symbolic_fun.c_linkage = self.c_linkage
-        symbolic_fun.emit_mode = self.emit_mode
+        try:
+            symbolic_fun = self.get_symbolic_function(name, signature)
+            symbolic_fun.c_attributes = self.c_attributes
+            symbolic_fun.c_linkage = self.c_linkage
+            symbolic_fun.emit_mode = self.emit_mode
 
-        self._compiled_functions[signature] = NumetaCompiledFunction(
-            name,
-            symbolic_fun,
-            path=self.directory,
-            do_checks=self.do_checks,
-            compile_flags=self.compile_flags,
-            backend=self.backend,
-            simd_arch=self.simd_arch,
-            simd_features=self.simd_features,
-            c_attributes=self.c_attributes,
-            c_linkage=self.c_linkage,
-            emit_mode=self.emit_mode,
-        )
+            self._compiled_functions[signature] = NumetaCompiledFunction(
+                name,
+                symbolic_fun,
+                path=self.directory,
+                do_checks=self.do_checks,
+                compile_flags=self.compile_flags,
+                backend=self.backend,
+                simd_arch=self.simd_arch,
+                simd_features=self.simd_features,
+                c_attributes=self.c_attributes,
+                c_linkage=self.c_linkage,
+                emit_mode=self.emit_mode,
+            )
 
-        symbolic_fun.parent = self._compiled_functions[signature]
+            symbolic_fun.parent = self._compiled_functions[signature]
+        except Exception:
+            self._compiled_functions.pop(signature, None)
+            self.return_signatures.pop(signature, None)
+            if not name_was_reserved:
+                native_name_registry.release(name)
+            raise
 
     def build_wrapper_spec(self, signature):
         return (

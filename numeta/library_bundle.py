@@ -797,6 +797,8 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
 
             procedures_infos = []
             for function in library._entries.values():
+                for signature in function._compiled_functions:
+                    function.construct_wrapper_spec(signature)
                 procedures_infos.extend(function._wrapper_specs.values())
             from .numeta_function import NumetaFunction
 

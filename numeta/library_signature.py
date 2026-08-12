@@ -5,7 +5,7 @@ import json
 
 import numpy as np
 
-from .datatype import DataTypeMeta
+from .datatype import DataTypeMeta, PointerType
 
 SIGNATURE_ID_VERSION = 1
 
@@ -51,6 +51,21 @@ def signature_json_value(value):
         }
     if isinstance(value, DataTypeMeta):
         return {"kind": "numeta.datatype", "name": value._name}
+    if isinstance(value, PointerType):
+        return {
+            "kind": "numeta.pointer",
+            "dtype": signature_json_value(value.dtype),
+            "const": value.const,
+            "restrict": value.restrict,
+            "volatile": value.volatile,
+        }
+    if isinstance(value, slice):
+        return {
+            "kind": "python.slice",
+            "start": signature_json_value(value.start),
+            "stop": signature_json_value(value.stop),
+            "step": signature_json_value(value.step),
+        }
     if isinstance(value, type):
         if value in (bool, int, float, complex, str):
             return {

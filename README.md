@@ -321,7 +321,9 @@ the function. Pass Numeta array descriptors, NumPy scalar types, Python scalar
 types, and literal values for `nm.comptime` parameters:
 
 ```python
-@nm.jit(backend="c", directory="./build")
+library = nm.NumetaLibrary("kernels")
+
+@nm.jit(backend="c", directory="./build", library=library)
 def scale(count: nm.comptime, values, factor):
     for i in range(count):
         values[i] *= factor
@@ -339,6 +341,30 @@ paths, and `compiled`/`loaded` state. Add the function to a `NumetaLibrary` and
 call `save()` when the precompiled specialization must be reused by another
 process. Loaded bundles retain the same inspection data; creating a new signature
 requires reattaching the Python implementation first.
+
+For several signatures, build one callable bundle without compiling an individual
+wrapper for each specialization:
+
+```python
+report = library.build(
+    "./dist",
+    specializations={
+        "scale": [
+            (4, nm.float64[:], float),
+            (8, nm.float32[:], float),
+        ]
+    },
+)
+
+print(report.bundle_path, report.created_count, report.reused_count)
+```
+
+Each call entry is normally a tuple of positional arguments. For keyword arguments,
+use `{"args": (...), "kwargs": {"factor": float}}`. Numeta validates the complete
+request before constructing signatures, compiles the shared dependency closure once,
+and atomically replaces `<name>.numeta/`. The returned `NumetaBuildReport` contains
+the requested specialization handles and final core-library, wrapper, and bundle
+paths.
 
 ### Cache Compiled Code
 

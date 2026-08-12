@@ -53,6 +53,7 @@ from .fortran.external_modules import iso_c, omp
 from .jit import c_function_attributes, jit
 from .c.emitter import CTranslationUnit
 from .numeta_library import NumetaLibrary
+from .build_report import NumetaBuildReport
 from .specialization import NumetaSpecialization
 from .exceptions import (
     CompilationError,
@@ -87,6 +88,7 @@ __all__ = [
     "IncompatibleLibraryError",
     "LegacyLibraryFormatError",
     "LibraryFormatError",
+    "NumetaBuildReport",
     "NumetaError",
     "NumetaLibrary",
     "NumetaNotImplementedError",

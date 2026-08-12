@@ -6,6 +6,12 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+*.so
+*.o
+*.mod
+*_src.c
+*_src.f90
+*.numeta/
 
 # --- Virtual Env ---
 .venv/
@@ -14,3 +20,13 @@ venv/
 # --- Testing & Coverage ---
 .pytest_cache/
 .coverage*
+
+# --- Numeta Runtime Artifacts ---
+parsers/
+*_capi.c
+*.pkl
+
+# --- Local Credentials ---
+*_token.txt
+.env
+.env.*

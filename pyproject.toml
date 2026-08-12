@@ -1,19 +1,28 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=77", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "numeta"
-version = "0.5.0"
+version = "0.6.0"
 description = "Numeta is a small transpiler for Python with a metaprogramming focus."
+readme = "README.md"
 authors = [
     { name = "Andrea Bianchi", email = "andrea_bianchi@outlook.com" }
 ]
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.12"
 
 dependencies = [
     "numpy"
+]
+
+[project.optional-dependencies]
+dev = [
+    "black==24.4.2",
+    "build",
+    "pre-commit",
+    "pytest",
 ]
 
 [tool.black]

@@ -632,59 +632,8 @@ class NumetaLibrary:
         )
         compiled_targets = _collect_compiled_target_closure(roots, active_targets)
 
-        from .ast.namespace import Namespace
-
         for compiled_target in compiled_targets:
-            if getattr(compiled_target, "_loaded_from_bundle", False):
-                import shutil
-
-                for source_file in compiled_target._source_files:
-                    source_file = Path(source_file)
-                    if source_file.exists():
-                        shutil.copy2(source_file, directory / source_file.name)
-                continue
-            if compiled_target.backend == "fortran":
-                fortran_src = directory / f"{compiled_target.func_name}_src.f90"
-                if isinstance(compiled_target.symbolic_function, Namespace):
-                    from .fortran.fortran_syntax import render_stmt_lines
-
-                    lines = render_stmt_lines(
-                        compiled_target.symbolic_function.get_declaration(), indent=0
-                    )
-                    fortran_src.write_text("".join(lines))
-                else:
-                    from .ir import FortranEmitter, lower_procedure
-
-                    ir_proc = lower_procedure(compiled_target.symbolic_function)
-                    emitter = FortranEmitter()
-                    fortran_src.write_text(emitter.emit_procedure(ir_proc))
-            elif compiled_target.backend == "c":
-                from numeta.c.emitter import CEmitter
-
-                c_src = directory / f"{compiled_target.func_name}_src.c"
-                emitter = CEmitter(
-                    simd_arch=getattr(compiled_target, "simd_arch", settings.default_simd_arch),
-                    simd_features=getattr(
-                        compiled_target,
-                        "simd_features",
-                        settings.default_simd_features,
-                    ),
-                )
-                if isinstance(compiled_target.symbolic_function, Namespace):
-                    c_code, _requires_math = emitter.emit_namespace(
-                        compiled_target.symbolic_function
-                    )
-                else:
-                    from .ir import lower_procedure
-
-                    ir_proc = lower_procedure(
-                        compiled_target.symbolic_function,
-                        backend="c",
-                    )
-                    c_code, _requires_math = emitter.emit_procedure(ir_proc)
-                c_src.write_text(c_code)
-            else:
-                raise ValueError(f"Unsupported backend: {compiled_target.backend}")
+            compiled_target.write_source(directory)
 
     def save(
         self,

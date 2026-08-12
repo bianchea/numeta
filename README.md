@@ -28,6 +28,7 @@ More rationale is in [Why Fortran Backend](#why-fortran-backend).
   - [C Backend Shared-Kernel ABI](#c-backend-shared-kernel-abi)
   - [Type Hints](#type-hints)
   - [Parallelizing Loops](#parallelizing-loops)
+  - [Ahead-of-Time Specialization](#ahead-of-time-specialization)
   - [Cache Compiled Code](#cache-compiled-code)
 - [Examples](#examples)
   - [First For Loop](#first-for-loop)
@@ -312,6 +313,32 @@ arrays are supported.
 
 Use `nm.prange` to parallelize loops with an OpenMP-style model. See the Parallel
 Loop Example section for shared variables and scheduling options.
+
+### Ahead-of-Time Specialization
+
+Use `specialize()` to generate and inspect a concrete signature without executing
+the function. Pass Numeta array descriptors, NumPy scalar types, Python scalar
+types, and literal values for `nm.comptime` parameters:
+
+```python
+@nm.jit(backend="c", directory="./build")
+def scale(count: nm.comptime, values, factor):
+    for i in range(count):
+        values[i] *= factor
+
+spec = scale.specialize(4, nm.float64[:], float)
+print(spec.signature_id, spec.symbol)
+print(spec.source)
+spec.compile()  # Builds native artifacts without loading or executing them.
+```
+
+`function.specializations` lists constructed signatures, and
+`function.get_specialization(signature_or_id)` retrieves one. A specialization
+also exposes its backend, compile flags, return signature, dependencies, artifact
+paths, and `compiled`/`loaded` state. Add the function to a `NumetaLibrary` and
+call `save()` when the precompiled specialization must be reused by another
+process. Loaded bundles retain the same inspection data; creating a new signature
+requires reattaching the Python implementation first.
 
 ### Cache Compiled Code
 

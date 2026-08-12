@@ -99,6 +99,78 @@ class NumetaCompiledFunction(ExternalLibrary):
     def library_name(self, value):
         self._library_name = value
 
+    @property
+    def source_suffix(self) -> str:
+        if self.backend == "fortran":
+            return "_src.f90"
+        if self.backend == "c":
+            return "_src.c"
+        raise ValueError(f"Unsupported backend: {self.backend}")
+
+    @property
+    def source_path(self) -> Path | None:
+        for source_file in getattr(self, "_source_files", ()):
+            source_path = Path(source_file)
+            if source_path.exists() and source_path.name.endswith(self.source_suffix):
+                return source_path
+        generated_path = self._path / f"{self.func_name}{self.source_suffix}"
+        return generated_path if generated_path.exists() else None
+
+    @property
+    def library_path(self) -> Path | None:
+        library = self._path / f"lib{self.library_name}.so"
+        return library if library.exists() else None
+
+    def render_source(self) -> str:
+        """Render the source used by native compilation without writing it."""
+        if getattr(self, "_loaded_from_bundle", False):
+            source_path = self.source_path
+            if source_path is None:
+                raise FileNotFoundError(f"No persisted source is available for {self.func_name!r}")
+            return source_path.read_text()
+
+        from .ast.namespace import Namespace
+
+        if self.backend == "fortran":
+            if isinstance(self.symbolic_function, Namespace):
+                from .fortran.fortran_syntax import render_stmt_lines
+
+                lines = render_stmt_lines(self.symbolic_function.get_declaration(), indent=0)
+                return "".join(lines)
+
+            from .ir import FortranEmitter, lower_procedure
+
+            return FortranEmitter().emit_procedure(lower_procedure(self.symbolic_function))
+
+        if self.backend == "c":
+            from numeta.c.emitter import CEmitter
+
+            emitter = CEmitter(simd_arch=self.simd_arch, simd_features=self.simd_features)
+            if isinstance(self.symbolic_function, Namespace):
+                source, requires_math = emitter.emit_namespace(self.symbolic_function)
+            else:
+                from .ir import lower_procedure
+
+                self.symbolic_function.c_attributes = self.c_attributes
+                self.symbolic_function.c_linkage = self.c_linkage
+                self.symbolic_function.emit_mode = self.emit_mode
+                ir_proc = lower_procedure(self.symbolic_function, backend="c")
+                source, requires_math = emitter.emit_procedure(ir_proc)
+            self._requires_math = requires_math
+            return source
+
+        raise ValueError(f"Unsupported backend: {self.backend}")
+
+    def write_source(self, directory: str | Path, *, track: bool = False) -> Path:
+        """Write the rendered source to ``directory`` and return its path."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        source_path = directory / f"{self.func_name}{self.source_suffix}"
+        source_path.write_text(self.render_source())
+        if track:
+            self._source_files = [source_path]
+        return source_path
+
     def adopt_compiled_state(self, replacement: "NumetaCompiledFunction") -> None:
         """Adopt replacement state while preserving this object's identity."""
         if not isinstance(replacement, NumetaCompiledFunction):
@@ -197,19 +269,7 @@ class NumetaCompiledFunction(ExternalLibrary):
                     setting="set_fortran_compiler",
                     env_var="NUMETA_FC",
                 )
-                fortran_src = self._path / f"{obj_name}_src.f90"
-                from .ir import FortranEmitter, lower_procedure
-                from .ast.namespace import Namespace
-
-                if isinstance(self.symbolic_function, Namespace):
-                    from numeta.fortran.fortran_syntax import render_stmt_lines
-
-                    lines = render_stmt_lines(self.symbolic_function.get_declaration(), indent=0)
-                    fortran_src.write_text("".join(lines))
-                else:
-                    ir_proc = lower_procedure(self.symbolic_function)
-                    emitter = FortranEmitter()
-                    fortran_src.write_text(emitter.emit_procedure(ir_proc))
+                fortran_src = self.write_source(self._path, track=True)
                 sources = [fortran_src]
                 include_dirs = []
                 additional_flags = []
@@ -217,9 +277,6 @@ class NumetaCompiledFunction(ExternalLibrary):
             elif self.backend == "c":
                 import numpy as np
                 import sysconfig
-                from numeta.c.emitter import CEmitter
-                from .ir import lower_procedure
-                from .ast.namespace import Namespace
 
                 compiler = Compiler(
                     settings.c_compiler,
@@ -227,18 +284,7 @@ class NumetaCompiledFunction(ExternalLibrary):
                     setting="set_c_compiler",
                     env_var="NUMETA_CC",
                 )
-                c_src = self._path / f"{obj_name}_src.c"
-                emitter = CEmitter(simd_arch=self.simd_arch, simd_features=self.simd_features)
-                if isinstance(self.symbolic_function, Namespace):
-                    c_code, requires_math = emitter.emit_namespace(self.symbolic_function)
-                else:
-                    self.symbolic_function.c_attributes = getattr(self, "c_attributes", ())
-                    self.symbolic_function.c_linkage = getattr(self, "c_linkage", None)
-                    self.symbolic_function.emit_mode = getattr(self, "emit_mode", None)
-                    ir_proc = lower_procedure(self.symbolic_function, backend="c")
-                    c_code, requires_math = emitter.emit_procedure(ir_proc)
-                c_src.write_text(c_code)
-                self._requires_math = requires_math
+                c_src = self.write_source(self._path, track=True)
                 sources = [c_src]
                 include_dirs = [
                     sysconfig.get_paths()["include"],
@@ -248,8 +294,6 @@ class NumetaCompiledFunction(ExternalLibrary):
                 obj_suffix = "_c.o"
             else:
                 raise ValueError(f"Unsupported backend: {self.backend}")
-
-            self._source_files = list(sources)
 
             for lib in self.symbolic_function.get_dependencies().values():
 
@@ -385,6 +429,15 @@ class NumetaFunction(BaseFunction):
     @property
     def uses_c_dispatch(self):
         return _c_dispatch_base_available and self._use_c_dispatch_instance
+
+    @property
+    def specializations(self):
+        """Return read-only handles for all constructed signatures."""
+        from .specialization import NumetaSpecialization
+
+        return tuple(
+            NumetaSpecialization(self, signature) for signature in self._compiled_functions
+        )
 
     def __init__(
         self,
@@ -540,6 +593,70 @@ class NumetaFunction(BaseFunction):
             catch_var_positional_name=self.catch_var_positional_name,
         )
         return signature
+
+    def _normalize_specialization_signature(self, signature):
+        """Match symbolic NumPy type tokens to runtime ``numpy.dtype`` keys."""
+        normalized = []
+        for index, item in enumerate(signature):
+            if index < self.n_positional_or_default_args:
+                parameter = self.params[self.fixed_param_indices[index]]
+                if parameter.is_comptime:
+                    normalized.append(item)
+                    continue
+
+            if isinstance(item, tuple) and len(item) >= 2:
+                dtype_token = item[1]
+                if isinstance(dtype_token, type) and issubclass(dtype_token, np.generic):
+                    item = (item[0], np.dtype(dtype_token), *item[2:])
+            normalized.append(item)
+        return tuple(normalized)
+
+    def specialize(self, *args, **kwargs):
+        """Construct and return a specialization without compiling or executing it."""
+        signature = self._normalize_specialization_signature(self.get_signature(*args, **kwargs))
+        if signature not in self._compiled_functions:
+            if self._func is None:
+                raise RuntimeError(
+                    f"Function {self.name!r} was loaded without its Python body and cannot "
+                    "create a new specialization. Reattach it with @nm.jit(..., "
+                    "library=library, reattach=True) first."
+                )
+            self.construct_compiled_target(signature)
+
+        from .specialization import NumetaSpecialization
+
+        return NumetaSpecialization(self, signature)
+
+    def get_specialization(self, signature_or_id):
+        """Return an existing specialization by signature tuple or stable ID."""
+        from .library_signature import signature_id
+        from .specialization import NumetaSpecialization
+
+        if isinstance(signature_or_id, NumetaSpecialization):
+            if signature_or_id.function is not self:
+                raise ValueError("specialization belongs to a different Numeta function")
+            signature = signature_or_id.signature
+        elif isinstance(signature_or_id, str):
+            signature = next(
+                (
+                    candidate
+                    for candidate in self._compiled_functions
+                    if signature_id(candidate) == signature_or_id
+                ),
+                None,
+            )
+            if signature is None:
+                raise KeyError(
+                    f"Function {self.name!r} has no specialization with id {signature_or_id!r}"
+                )
+        else:
+            signature = self._normalize_specialization_signature(signature_or_id)
+
+        if signature not in self._compiled_functions:
+            raise KeyError(
+                f"Function {self.name!r} has no specialization for signature {signature!r}"
+            )
+        return NumetaSpecialization(self, signature)
 
     def _handle_cache_miss(self, signature, runtime_args):
         """Called by C dispatch on cache miss."""
@@ -928,6 +1045,13 @@ class NumetaFunction(BaseFunction):
         return self._pyc_extensions[signature]
 
     def get_pyc_extension(self, signature):
+        existing = self._existing_pyc_extension(signature)
+        if existing is not None:
+            return existing
+
+        return self.construct_wrapper(signature)
+
+    def _existing_pyc_extension(self, signature):
         if signature in self._pyc_extensions:
             return self._pyc_extensions[signature]
 
@@ -937,9 +1061,9 @@ class NumetaFunction(BaseFunction):
                 if name == compiled_name:
                     return self._library_pyc_extension
 
-        return self.construct_wrapper(signature)
+        return None
 
-    def compile(self, signature):
+    def _compile_signature(self, signature):
         if not self._compiled_functions[signature].compiled:
             self._compiled_functions[signature].compile()
 
@@ -953,13 +1077,17 @@ class NumetaFunction(BaseFunction):
                 backend=self.backend,
             )
 
+    def compile(self, signature):
+        """Compile an existing signature without loading its wrapper."""
+        return self._compile_signature(signature)
+
     def load(self, signature):
         if signature not in self._compiled_functions:
             self.construct_compiled_target(signature)
         self.construct_wrapper_spec(signature)
         pyc_extension = self.get_pyc_extension(signature)
         if pyc_extension.lib_path is None:
-            self.compile(signature)
+            self._compile_signature(signature)
             pyc_extension = self.get_pyc_extension(signature)
         self._fast_call[signature] = pyc_extension.load(
             self._compiled_functions[signature].func_name

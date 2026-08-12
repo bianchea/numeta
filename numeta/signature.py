@@ -94,6 +94,8 @@ def _signature_dtype_token(dtype):
 
 def _contains_symbolic_signature_arg(args, kwargs) -> bool:
     def is_symbolic(arg):
+        if isinstance(arg, type) and arg in (bool, int, float, complex):
+            return True
         if isinstance(arg, (ArrayType, PointerType, ExpressionNode)):
             return True
         return isinstance(arg, type) and issubclass(arg, DataType)
@@ -205,6 +207,9 @@ def _get_signature_and_runtime_args_py(
                     name,
                     arg.dtype,
                 )
+        elif isinstance(arg, type) and arg in (bool, int, float, complex):
+            to_execute = False
+            arg_signature = (name, arg)
         elif isinstance(arg, ArrayType):
             to_execute = False
             dtype_token = _signature_dtype_token(arg.dtype)

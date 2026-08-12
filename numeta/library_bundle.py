@@ -46,7 +46,7 @@ from .signature import ParameterInfo, Signature, validate_comptime_signature
 from ._version import __version__ as NUMETA_VERSION
 
 BUNDLE_FORMAT = "numeta-library"
-BUNDLE_FORMAT_VERSION = 2
+BUNDLE_FORMAT_VERSION = 3
 
 
 def _make_persisted_procedure(name: str, arguments) -> Procedure:
@@ -507,6 +507,10 @@ def _serialize_function(function) -> dict:
                 "signature_id": signature_id(signature),
                 "symbol": compiled.func_name,
                 "returns": _encode_value(function.return_signatures.get(signature, [])),
+                "shape_equalities": [
+                    [equality.left, equality.right]
+                    for equality in function.construct_wrapper_spec(signature).shape_equalities
+                ],
             }
         )
     return {
@@ -675,9 +679,14 @@ def _restore_function(payload, targets, bundle: Path):
             )
         state["return_signatures"][signature] = _decode_value(specialization["returns"])
         state["_compiled_functions"][signature] = targets[specialization["symbol"]]
+        state["_wrapper_specs"][signature] = specialization["shape_equalities"]
     function.__setstate__(state)
     for signature in function._compiled_functions:
-        function._wrapper_specs[signature] = function.build_wrapper_spec(signature)
+        shape_equalities = function._wrapper_specs.get(signature, ())
+        function._wrapper_specs[signature] = function.build_wrapper_spec(
+            signature,
+            shape_equalities=shape_equalities,
+        )
     return function
 
 
@@ -748,6 +757,16 @@ def _validate_manifest(manifest: dict, bundle: Path) -> None:
     function_check_policies = {}
     for function in manifest["functions"]:
         for specialization in function.get("specializations", []):
+            equalities = specialization.get("shape_equalities")
+            if not isinstance(equalities, list) or any(
+                not isinstance(equality, list)
+                or len(equality) != 2
+                or not all(isinstance(name, str) for name in equality)
+                for equality in equalities
+            ):
+                raise CorruptLibraryError(
+                    f"Invalid shape equalities for symbol {specialization.get('symbol')!r}"
+                )
             function_check_policies[specialization["symbol"]] = function["do_checks"]
     for symbol, target in manifest["targets"].items():
         target_mismatches = metadata_mismatches(

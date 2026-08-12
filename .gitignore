@@ -23,6 +23,7 @@ venv/
 
 # --- Numeta Runtime Artifacts ---
 parsers/
+.numeta-symbols/
 *_capi.c
 *.pkl
 

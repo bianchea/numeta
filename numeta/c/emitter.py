@@ -41,6 +41,7 @@ from numeta.ir.nodes import (
     IRLiteral,
     IRPrint,
     IRProcedure,
+    IRReduce,
     IRReturn,
     IRSimdStore,
     IRSlice,
@@ -446,6 +447,9 @@ class CEmitter:
         proc: IRProcedure,
         config: CFunctionConfig | None = None,
     ) -> dict[str, list[str] | str]:
+        from numeta.ir.passes import normalize_reductions
+
+        proc = normalize_reductions(proc)
         self._prepare_procedure_context(proc)
         arg_specs = self._build_signature(proc)
         self._collect_simd_requirements(proc)
@@ -1396,6 +1400,8 @@ class CEmitter:
             target = self._render_expr(stmt.target)
             value = self._render_expr(stmt.value)
             return [f"{'    ' * indent}{target} = {value};\n"]
+        if isinstance(stmt, IRReduce):
+            return self._render_reduction(stmt, indent)
         if isinstance(stmt, IRCall):
             if isinstance(stmt.func, IRVarRef) and stmt.func.var is not None:
                 if stmt.func.var.name == "numpy_allocate":
@@ -1534,6 +1540,63 @@ class CEmitter:
                 return []
             return [f"{'    ' * indent}/* unsupported statement */\n"]
         return [f"{'    ' * indent}/* unsupported statement */\n"]
+
+    def _render_reduction(self, stmt: IRReduce, indent: int) -> list[str]:
+        value = stmt.value
+        dims = self._shape_dims_for_expr(value)
+        if not dims:
+            self._raise_with_source(
+                NotImplementedError,
+                f"Cannot lower {stmt.op} reduction without array dimensions",
+                origin=stmt,
+            )
+        if stmt.target is None or stmt.target.var is None:
+            self._raise_with_source(TypeError, "Reduction target is missing", origin=stmt)
+
+        target = stmt.target.var.name
+        suffix = target.removeprefix("_nm_reduce_")
+        ctype = self._map_irvar_to_ctype(stmt.target.var)
+        lines = []
+        if stmt.op == "all":
+            lines.append(f"{'    ' * indent}{target} = ({ctype})1;\n")
+        else:
+            lines.append(f"{'    ' * indent}{target} = ({ctype})0;\n")
+
+        has_value = None
+        if stmt.op in {"maxval", "minval"}:
+            has_value = f"_nm_reduce_has_value_{suffix}"
+            lines.append(f"{'    ' * indent}npy_bool {has_value} = 0;\n")
+
+        indices = [f"_nm_reduce_i_{suffix}_{axis}" for axis in range(len(dims))]
+        loop_indent = indent
+        for index, dim in zip(indices, dims):
+            lines.append(
+                f"{'    ' * loop_indent}for (npy_intp {index} = 0; "
+                f"{index} < {dim}; {index}++) {{\n"
+            )
+            loop_indent += 1
+
+        item = self._render_expr_with_slice(value, indices)
+        if stmt.op == "sum":
+            lines.append(f"{'    ' * loop_indent}{target} += ({item});\n")
+        elif stmt.op == "all":
+            lines.append(f"{'    ' * loop_indent}{target} = {target} && ({item});\n")
+        else:
+            item_name = f"_nm_reduce_item_{suffix}"
+            comparison = ">" if stmt.op == "maxval" else "<"
+            lines.append(f"{'    ' * loop_indent}{ctype} {item_name} = ({item});\n")
+            lines.append(
+                f"{'    ' * loop_indent}if (!{has_value} || "
+                f"{item_name} {comparison} {target}) {{\n"
+            )
+            lines.append(f"{'    ' * (loop_indent + 1)}{target} = {item_name};\n")
+            lines.append(f"{'    ' * (loop_indent + 1)}{has_value} = 1;\n")
+            lines.append(f"{'    ' * loop_indent}}}\n")
+
+        for _ in indices:
+            loop_indent -= 1
+            lines.append(f"{'    ' * loop_indent}}}\n")
+        return lines
 
     def _render_simd_store(self, stmt: IRSimdStore, indent: int) -> list[str]:
         vector_dtype = self._dtype_from_expr(stmt.value)

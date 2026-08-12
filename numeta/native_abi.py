@@ -11,7 +11,7 @@ import numpy as np
 
 from .settings import settings
 
-NUMETA_WRAPPER_ABI_VERSION = 1
+NUMETA_WRAPPER_ABI_VERSION = 2
 CODEGEN_ABI_SETTINGS_VERSION = 1
 
 

@@ -60,7 +60,9 @@ More rationale is in [Why Fortran Backend](#why-fortran-backend).
 Numeta is still experimental. Compiled functions can return scalars or NumPy arrays,
 but not arbitrary Python objects. Only a subset of Python and NumPy is currently
 supported. Backend coverage is evolving and some features may be better supported
-in one backend than the other.
+in one backend than the other. Returned arrays use new NumPy-owned allocations;
+returning an input array therefore copies its data instead of creating a zero-copy
+view.
 
 ## Installation
 
@@ -143,6 +145,9 @@ nm.settings.set_default_compile_flags("-O2 -march=native")
 ```
 
 Passing `None` to `@nm.jit` parameters will also use these defaults.
+With checks enabled, wrappers validate array dtype and layout plus inferred equal-
+shape contracts for whole-array elementwise assignments such as `target[:] = source`.
+Disabling checks removes those runtime guards.
 
 ### Backends
 
@@ -764,6 +769,10 @@ Contributions are welcome! If you'd like to contribute, please open an issue or 
 Install development tools with `python -m pip install -e ".[dev]"`. Run
 `pytest -v --backend=c` and `pytest -v --backend=fortran` independently, then run
 `black --check numeta tests setup.py`. See `AGENTS.md` for repository conventions.
+Measure warmed cache-hit overhead with
+`python benchmarks/dispatch_cache_hits.py`; pass `--numba` for a Numba comparison or
+`--json` for machine-readable output. Numba is an optional benchmark dependency and
+is imported only when `--numba` is requested.
 
 ## Troubleshooting
 

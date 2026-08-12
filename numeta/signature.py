@@ -2,7 +2,7 @@ import inspect
 import math
 import sysconfig
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_type_hints
 
 import numpy as np
 
@@ -23,57 +23,68 @@ _SUPPORTED_COMPTIME_VALUES = (
 )
 
 
+def _comptime_location(parameter_name, path):
+    return f"Comptime argument {parameter_name!r}{path}"
+
+
+def _reject_comptime_value(value, parameter_name, path, reason=None):
+    value_type = f"{type(value).__module__}.{type(value).__qualname__}"
+    detail = f" ({reason})" if reason else ""
+    raise TypeError(
+        f"{_comptime_location(parameter_name, path)} has unsupported type {value_type}{detail}; "
+        f"supported values are {_SUPPORTED_COMPTIME_VALUES}"
+    )
+
+
+def _validate_comptime_value(value, parameter_name, path):
+    value_type = type(value)
+    if value is None or value_type in (bool, int, str):
+        return
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{_comptime_location(parameter_name, path)} must be finite")
+        return
+    if value_type is complex:
+        if not math.isfinite(value.real) or not math.isfinite(value.imag):
+            location = _comptime_location(parameter_name, path)
+            raise ValueError(f"{location} must have finite real and imaginary parts")
+        return
+    if value_type is tuple:
+        for index, nested in enumerate(value):
+            _validate_comptime_value(nested, parameter_name, f"{path}[{index}]")
+        return
+    if value_type is slice:
+        _validate_comptime_value(value.start, parameter_name, f"{path}.start")
+        _validate_comptime_value(value.stop, parameter_name, f"{path}.stop")
+        _validate_comptime_value(value.step, parameter_name, f"{path}.step")
+        return
+    if isinstance(value, np.dtype):
+        return
+    if isinstance(value, np.generic):
+        scalar_value = value.item()
+        if isinstance(scalar_value, np.generic):
+            _reject_comptime_value(
+                value,
+                parameter_name,
+                path,
+                "the scalar has no stable Python representation",
+            )
+        _validate_comptime_value(scalar_value, parameter_name, path)
+        return
+    if isinstance(value, DataTypeMeta) or value_type is PointerType:
+        return
+    if isinstance(value, type) and (
+        value in (bool, int, float, complex, str) or issubclass(value, np.generic)
+    ):
+        return
+    _reject_comptime_value(value, parameter_name, path)
+
+
 def validate_comptime_value(value, parameter_name: str) -> None:
     """Reject comptime values that cannot form stable, reproducible cache keys."""
-
-    def location(path):
-        return f"Comptime argument {parameter_name!r}{path}"
-
-    def reject(item, path, reason=None):
-        value_type = f"{type(item).__module__}.{type(item).__qualname__}"
-        detail = f" ({reason})" if reason else ""
-        raise TypeError(
-            f"{location(path)} has unsupported type {value_type}{detail}; "
-            f"supported values are {_SUPPORTED_COMPTIME_VALUES}"
-        )
-
-    def validate(item, path=""):
-        if item is None or type(item) in (bool, int, str):
-            return
-        if type(item) is float:
-            if not math.isfinite(item):
-                raise ValueError(f"{location(path)} must be finite")
-            return
-        if type(item) is complex:
-            if not math.isfinite(item.real) or not math.isfinite(item.imag):
-                raise ValueError(f"{location(path)} must have finite real and imaginary parts")
-            return
-        if type(item) is tuple:
-            for index, nested in enumerate(item):
-                validate(nested, f"{path}[{index}]")
-            return
-        if type(item) is slice:
-            validate(item.start, f"{path}.start")
-            validate(item.stop, f"{path}.stop")
-            validate(item.step, f"{path}.step")
-            return
-        if isinstance(item, np.dtype):
-            return
-        if isinstance(item, np.generic):
-            scalar_value = item.item()
-            if isinstance(scalar_value, np.generic):
-                reject(item, path, "the scalar has no stable Python representation")
-            validate(scalar_value, path)
-            return
-        if isinstance(item, DataTypeMeta) or type(item) is PointerType:
-            return
-        if isinstance(item, type) and (
-            item in (bool, int, float, complex, str) or issubclass(item, np.generic)
-        ):
-            return
-        reject(item, path)
-
-    validate(value)
+    _validate_comptime_value(value, parameter_name, "")
+    if value is None or type(value) in (bool, int, float, complex, str):
+        return
     try:
         hash(value)
     except (TypeError, ValueError) as exc:
@@ -93,14 +104,16 @@ def _type_aware_equal(left, right) -> bool:
     if left is right:
         return True
     if isinstance(left, tuple) and isinstance(right, tuple):
-        return len(left) == len(right) and all(
-            _type_aware_equal(left_item, right_item) for left_item, right_item in zip(left, right)
-        )
+        if len(left) != len(right):
+            return False
+        for left_item, right_item in zip(left, right):
+            if not _type_aware_equal(left_item, right_item):
+                return False
+        return True
     if type(left) is not type(right):
         return False
     try:
-        result = left == right
-        return bool(result)
+        return bool(left == right)
     except (TypeError, ValueError):
         return False
 
@@ -257,11 +270,21 @@ class ParameterInfo:
 def parse_function_parameters(func):
     py_signature = inspect.signature(func)
 
+    try:
+        resolved_annotations = get_type_hints(func)
+    except (NameError, TypeError):
+        resolved_annotations = {}
+
     params = []
     catch_var_positional_name = "args"
 
     for name, parameter in py_signature.parameters.items():
-        is_comp = func.__annotations__.get(name) is comptime
+        raw_annotation = func.__annotations__.get(name)
+        annotation = resolved_annotations.get(name, raw_annotation)
+        is_comp = annotation is comptime or (
+            isinstance(raw_annotation, str)
+            and raw_annotation.strip() in {"comptime", "nm.comptime", "numeta.comptime"}
+        )
         params.append(ParameterInfo(name, parameter.kind, parameter.default, is_comp))
 
         if parameter.kind == inspect.Parameter.VAR_POSITIONAL:

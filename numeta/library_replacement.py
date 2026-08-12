@@ -34,17 +34,20 @@ def validate_specialization_compatibility(
     if new_spec is None:
         new_spec = new_func.build_wrapper_spec(signature)
 
-    old_name, old_args, old_returns = old_spec
-    new_name, new_args, new_returns = new_spec
-    if old_name != new_name:
+    if old_spec.name != new_spec.name:
         raise AssertionError("replacement did not preserve compiled symbol name")
-    if old_args != new_args:
+    if old_spec.arguments != new_spec.arguments:
         raise ValueError(
             f"Replacement for {old_func.name!r} changed argument ABI for signature {signature!r}"
         )
-    if old_returns != new_returns:
+    if old_spec.returns != new_spec.returns:
         raise ValueError(
             f"Replacement for {old_func.name!r} changed return ABI for signature {signature!r}"
+        )
+    if old_spec.shape_equalities != new_spec.shape_equalities:
+        raise ValueError(
+            f"Replacement for {old_func.name!r} changed runtime shape checks for "
+            f"signature {signature!r}"
         )
 
 

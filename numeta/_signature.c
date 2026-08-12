@@ -1059,34 +1059,36 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
             PyObject **runtime_args = stack_buf;
             PyObject **sig = sig_buf;
 
-            // Validate comptime items before hashing the signature for cache lookup.
-            for (int i = 0; i < parsed_nargs; i++) {
-                PyObject *param = PyList_GetItem(self->params, i);
-                PyObject *p_is_comptime = PyObject_GetAttr(param, str_is_comptime);
-                if (!p_is_comptime) {
-                    for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
-                    Py_XDECREF(tmp_kwargs);
-                    return NULL;
-                }
-                int is_comptime = PyObject_IsTrue(p_is_comptime);
-                Py_DECREF(p_is_comptime);
-                if (is_comptime < 0) {
-                    for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
-                    Py_XDECREF(tmp_kwargs);
-                    return NULL;
-                }
-                if (is_comptime) {
-                    PyObject *p_name = PyObject_GetAttr(param, str_name);
-                    PyObject *validation = p_name ? PyObject_CallFunctionObjArgs(
-                        ValidateComptimeValue, sig[i], p_name, NULL
-                    ) : NULL;
-                    Py_XDECREF(p_name);
-                    if (!validation) {
+            if (parsed_nruntime < parsed_nargs) {
+                // Validate comptime items before hashing the signature for cache lookup.
+                for (int i = 0; i < parsed_nargs; i++) {
+                    PyObject *param = PyList_GetItem(self->params, i);
+                    PyObject *p_is_comptime = PyObject_GetAttr(param, str_is_comptime);
+                    if (!p_is_comptime) {
                         for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
                         Py_XDECREF(tmp_kwargs);
                         return NULL;
                     }
-                    Py_DECREF(validation);
+                    int is_comptime = PyObject_IsTrue(p_is_comptime);
+                    Py_DECREF(p_is_comptime);
+                    if (is_comptime < 0) {
+                        for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
+                        Py_XDECREF(tmp_kwargs);
+                        return NULL;
+                    }
+                    if (is_comptime) {
+                        PyObject *p_name = PyObject_GetAttr(param, str_name);
+                        PyObject *validation = p_name ? PyObject_CallFunctionObjArgs(
+                            ValidateComptimeValue, sig[i], p_name, NULL
+                        ) : NULL;
+                        Py_XDECREF(p_name);
+                        if (!validation) {
+                            for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
+                            Py_XDECREF(tmp_kwargs);
+                            return NULL;
+                        }
+                        Py_DECREF(validation);
+                    }
                 }
             }
             

@@ -65,7 +65,7 @@ def test_wrapper_cache_records_abi_and_build_provenance():
         simd_features=("fma",),
     )
 
-    assert info["format_version"] == WRAPPER_CACHE_FORMAT_VERSION == 2
+    assert info["format_version"] == WRAPPER_CACHE_FORMAT_VERSION == 3
     assert info["numpy_c_abi"] == numpy_c_abi_version()
     assert info["compiler"] == compiler
     assert info["compile_flags"] == ["-O2", "-fno-strict-aliasing"]
@@ -185,7 +185,7 @@ def test_bundle_records_target_and_wrapper_provenance(tmp_path, backend):
     target = manifest["targets"][specialization.symbol]
     wrapper = manifest["wrapper_cache_info"]
 
-    assert manifest["format_version"] == 2
+    assert manifest["format_version"] == 3
     assert manifest["abi"]["codegen_settings"] == codegen_abi_settings()
     assert target["backend"] == backend
     assert target["compile_flags"] == ["-O2"]

@@ -152,6 +152,13 @@ class IRAssign(IRStmt):
 
 
 @dataclass
+class IRReduce(IRStmt):
+    op: str = ""
+    target: IRVarRef | None = None
+    value: IRExpr | None = None
+
+
+@dataclass
 class IRIf(IRStmt):
     cond: IRExpr | None = None
     then: list[IRNode] = field(default_factory=list)

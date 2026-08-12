@@ -19,8 +19,9 @@ from .native_abi import (
     numpy_c_abi_version,
 )
 from .settings import settings
+from .wrapper_spec import WrapperSpec
 
-WRAPPER_CACHE_FORMAT_VERSION = 2
+WRAPPER_CACHE_FORMAT_VERSION = 3
 
 
 class PyCExtension:
@@ -34,7 +35,7 @@ class PyCExtension:
         function_checks=None,
     ):
         self.name = f"{name}{self.SUFFIX}"
-        self.functions = functions
+        self.functions = [WrapperSpec.coerce(function) for function in functions]
         self.do_checks = do_checks
         self.function_checks = dict(function_checks or {})
         self.lib_path = None
@@ -223,7 +224,10 @@ PyMODINIT_FUNC PyInit_${name}(void) {
         procedure_definitions = []
         module_procedures = []
 
-        for name, args_details, return_specs in self.functions:
+        for function_spec in self.functions:
+            name = function_spec.name
+            args_details = function_spec.arguments
+            return_specs = function_spec.returns
 
             # find the structs
             for arg in args_details:
@@ -253,6 +257,7 @@ PyMODINIT_FUNC PyInit_${name}(void) {
                     name,
                     args_details,
                     return_specs,
+                    shape_equalities=function_spec.shape_equalities,
                     do_checks=self.function_checks.get(name, self.do_checks),
                 )
             )
@@ -266,7 +271,15 @@ PyMODINIT_FUNC PyInit_${name}(void) {
 
         return module_template
 
-    def construct_procedure(self, name, args_details, return_specs, *, do_checks=None):
+    def construct_procedure(
+        self,
+        name,
+        args_details,
+        return_specs,
+        *,
+        shape_equalities=(),
+        do_checks=None,
+    ):
         template = """
 void ${fortran_name}(${fortran_args});
 
@@ -309,7 +322,13 @@ static PyObject* ${procedure_name}(PyObject *self, PyObject *const *args, Py_ssi
 
         substitutions["checks"] = ""
         if self.do_checks if do_checks is None else do_checks:
-            substitutions["checks"] = "\n    ".join([self.get_check(var) for var in args])
+            checks = [self.get_check(var) for var in args]
+            checks.extend(
+                self.get_shape_check(left, right, index)
+                for index, equality in enumerate(shape_equalities)
+                for left, right in ((equality.left, equality.right),)
+            )
+            substitutions["checks"] = "\n    ".join(checks)
 
         call_args = [self.get_call_args(var) for var in args]
 
@@ -466,7 +485,22 @@ static PyObject* ${procedure_name}(PyObject *self, PyObject *const *args, Py_ssi
         else:
             return ""
 
-            self.construct_module()
+    @staticmethod
+    def get_shape_check(left, right, index):
+        return f"""
+    if (PyArray_NDIM({left}) != PyArray_NDIM({right})) {{
+        PyErr_SetString(PyExc_ValueError, "Array shapes for '{left}' and '{right}' must match");
+        return NULL;
+    }}
+    for (int _nm_shape_dim_{index} = 0;
+         _nm_shape_dim_{index} < PyArray_NDIM({left});
+         _nm_shape_dim_{index}++) {{
+        if (PyArray_DIM({left}, _nm_shape_dim_{index}) !=
+            PyArray_DIM({right}, _nm_shape_dim_{index})) {{
+            PyErr_SetString(PyExc_ValueError, "Array shapes for '{left}' and '{right}' must match");
+            return NULL;
+        }}
+    }}"""
 
     def write(self, filename: Path):
         extension_module = self.construct_module()

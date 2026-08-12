@@ -1,7 +1,11 @@
+import hashlib
 import numpy as np
+import os
 from pathlib import Path
 import tempfile
 import warnings
+from contextlib import contextmanager
+from threading import Lock, RLock, local
 from typing import Iterable
 import sysconfig
 from dataclasses import dataclass
@@ -23,11 +27,85 @@ from .signature import (
     validate_comptime_signature,
 )
 from .native_name_registry import native_name_registry
+from .shape_contracts import infer_shape_equalities
+from .wrapper_spec import WrapperSpec
 from .native_abi import (
     codegen_abi_settings,
     format_metadata_mismatches,
     metadata_mismatches,
 )
+
+_build_lock_registry_guard = Lock()
+_build_thread_locks = {}
+_build_lock_state = local()
+
+
+@contextmanager
+def _directory_build_lock(directory: Path):
+    """Serialize native builds that target the same directory across processes."""
+    import fcntl
+
+    lock_id = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:24]
+    with _build_lock_registry_guard:
+        thread_lock = _build_thread_locks.setdefault(lock_id, RLock())
+    with thread_lock:
+        held = getattr(_build_lock_state, "held", {})
+        _build_lock_state.held = held
+        if lock_id in held:
+            held[lock_id][0] += 1
+            try:
+                yield
+            finally:
+                held[lock_id][0] -= 1
+            return
+
+        lock_root = Path(tempfile.gettempdir()) / f"numeta-build-locks-{os.getuid()}"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        handle = (lock_root / f"{lock_id}.lock").open("a+b")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        held[lock_id] = [1, handle]
+        try:
+            yield
+        finally:
+            held.pop(lock_id)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def _symbol_reservation_path(directory: Path, name: str) -> Path:
+    symbol_id = hashlib.sha256(name.encode()).hexdigest()
+    return directory / ".numeta-symbols" / symbol_id
+
+
+def _reserve_native_symbol(directory: Path, name: str, *, allow_existing: bool) -> bool:
+    reservation = _symbol_reservation_path(directory, name)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    if reservation.exists():
+        if allow_existing:
+            return False
+        raise FileExistsError(name)
+    reservation.touch(exist_ok=False)
+    return True
+
+
+def _release_native_symbol(directory: Path, name: str) -> None:
+    _symbol_reservation_path(directory, name).unlink(missing_ok=True)
+
+
+def _native_artifact_exists(directory: Path, name: str) -> bool:
+    """Return whether a generated artifact already owns ``name`` on disk."""
+    filenames = (
+        f"{name}_src.c",
+        f"{name}_src.f90",
+        f"{name}_c.o",
+        f"{name}_fortran.o",
+        f"lib{name}.so",
+        f"{name}{PyCExtension.SUFFIX}.c",
+        f"lib{name}{PyCExtension.SUFFIX}.so",
+    )
+    return _symbol_reservation_path(directory, name).exists() or any(
+        (directory / filename).exists() for filename in filenames
+    )
 
 
 @dataclass
@@ -71,7 +149,7 @@ class NumetaCompiledFunction(ExternalLibrary):
             path = tempfile.mkdtemp()
         self.func_name = func_name
         self._path = Path(path).absolute()
-        self._path.mkdir(exist_ok=True)
+        self._path.mkdir(parents=True, exist_ok=True)
         self._rpath = self._path
         if do_checks is None:
             do_checks = settings.default_do_checks
@@ -456,14 +534,16 @@ class NumetaFunction(BaseFunction):
     def _deduplicate_wrapper_specs(wrapper_specs):
         wrapper_specs_by_name = {}
         deduplicated = []
-        for wrapper_spec in wrapper_specs:
-            existing = wrapper_specs_by_name.get(wrapper_spec[0])
+        for value in wrapper_specs:
+            wrapper_spec = WrapperSpec.coerce(value)
+            existing = wrapper_specs_by_name.get(wrapper_spec.name)
             if existing is None:
-                wrapper_specs_by_name[wrapper_spec[0]] = wrapper_spec
+                wrapper_specs_by_name[wrapper_spec.name] = wrapper_spec
                 deduplicated.append(wrapper_spec)
             elif existing != wrapper_spec:
                 raise ValueError(
-                    f"Conflicting wrapper definition for compiled procedure {wrapper_spec[0]!r}"
+                    f"Conflicting wrapper definition for compiled procedure "
+                    f"{wrapper_spec.name!r}"
                 )
         return deduplicated
 
@@ -501,7 +581,7 @@ class NumetaFunction(BaseFunction):
         if directory is None:
             directory = tempfile.mkdtemp()
         self.directory = Path(directory).absolute()
-        self.directory.mkdir(exist_ok=True)
+        self.directory.mkdir(parents=True, exist_ok=True)
         if do_checks is None:
             do_checks = settings.default_do_checks
         self.do_checks = do_checks
@@ -566,7 +646,8 @@ class NumetaFunction(BaseFunction):
         if self.uses_c_dispatch:
             from .signature import compile_custom_signature_parser
 
-            result = compile_custom_signature_parser(self.name, self.params, self.directory)
+            with _directory_build_lock(self.directory):
+                result = compile_custom_signature_parser(self.name, self.params, self.directory)
             if result:
                 self._set_custom_parser(*result)
 
@@ -714,11 +795,18 @@ class NumetaFunction(BaseFunction):
 
     def _handle_cache_miss(self, signature, runtime_args):
         """Called by C dispatch on cache miss."""
-        if signature not in self._compiled_functions:
-            self.construct_compiled_target(signature)
+        if self._func is None and signature not in self._compiled_functions:
+            raise RuntimeError(
+                f"Function {self.name!r} was loaded without its Python body and cannot "
+                "create a new specialization. Reattach it with @nm.jit(..., "
+                "library=library, reattach=True) first."
+            )
 
-        self.load(signature)
-        return self._fast_call[signature](*runtime_args)
+        with _directory_build_lock(self.directory):
+            if signature not in self._compiled_functions:
+                self.construct_compiled_target(signature)
+            self.load(signature)
+            return self._fast_call[signature](*runtime_args)
 
     def _handle_symbolic_call(self, signature, runtime_args):
         """Called by C dispatch when symbolic execution is required."""
@@ -829,7 +917,7 @@ class NumetaFunction(BaseFunction):
                 wrapper = self._pyc_extensions.get(signature)
                 if wrapper is not None:
                     for wrapper_spec in wrapper.functions:
-                        if wrapper_spec[0] == compiled.func_name:
+                        if wrapper_spec.name == compiled.func_name:
                             self._wrapper_specs[signature] = wrapper_spec
                             break
                 if signature not in self._wrapper_specs:
@@ -1003,7 +1091,23 @@ class NumetaFunction(BaseFunction):
         forced_name: str | None = None,
         allow_existing_name: bool = False,
     ):
+        with _directory_build_lock(self.directory):
+            return self._construct_compiled_target_locked(
+                signature,
+                forced_name=forced_name,
+                allow_existing_name=allow_existing_name,
+            )
+
+    def _construct_compiled_target_locked(
+        self,
+        signature,
+        *,
+        forced_name: str | None = None,
+        allow_existing_name: bool = False,
+    ):
         signature = self._coerce_signature(signature)
+        if forced_name is None and signature in self._compiled_functions:
+            return
 
         if forced_name is not None:
             name = forced_name
@@ -1021,14 +1125,18 @@ class NumetaFunction(BaseFunction):
         elif self.namer is None:
             suffix = len(native_name_registry.reserved_names)
             name = f"{self.name}_{suffix}"
-            if native_name_registry.is_reserved(name):
+            registry_collision = native_name_registry.is_reserved(name)
+            if registry_collision:
                 warnings.warn(
                     f"Compiled function name collision: '{name}' is already registered. "
                     "Picking a new name automatically; consider providing a custom namer "
                     "if you need stable names.",
                     RuntimeWarning,
                 )
-                while native_name_registry.is_reserved(name):
+            if registry_collision or _native_artifact_exists(self.directory, name):
+                while native_name_registry.is_reserved(name) or _native_artifact_exists(
+                    self.directory, name
+                ):
                     suffix += 1
                     name = f"{self.name}_{suffix}"
         else:
@@ -1049,6 +1157,21 @@ class NumetaFunction(BaseFunction):
             raise ValueError(
                 f"Compiled function name '{name}' conflicts with a loaded NumetaLibrary."
             )
+        try:
+            symbol_was_reserved = _reserve_native_symbol(
+                self.directory,
+                name,
+                allow_existing=allow_existing_name,
+            )
+        except FileExistsError as exc:
+            if self.namer is not None:
+                raise ValueError(
+                    f"Custom namer produced duplicate compiled name '{name}'. "
+                    "Use a more specific namer or a different output directory."
+                ) from exc
+            raise ValueError(
+                f"Compiled function name '{name}' already exists in {self.directory}."
+            ) from exc
         name_was_reserved = native_name_registry.is_reserved(name)
         native_name_registry.reserve(name)
 
@@ -1078,18 +1201,27 @@ class NumetaFunction(BaseFunction):
             self.return_signatures.pop(signature, None)
             if not name_was_reserved:
                 native_name_registry.release(name)
+            if symbol_was_reserved:
+                _release_native_symbol(self.directory, name)
             raise
 
-    def build_wrapper_spec(self, signature):
-        return (
+    def build_wrapper_spec(self, signature, *, shape_equalities=None):
+        argument_specs = convert_signature_to_argument_specs(
+            signature,
+            params=self.params,
+            fixed_param_indices=self.fixed_param_indices,
+            n_positional_or_default_args=self.n_positional_or_default_args,
+        )
+        if shape_equalities is None:
+            shape_equalities = infer_shape_equalities(
+                self._compiled_functions[signature].symbolic_function,
+                argument_specs,
+            )
+        return WrapperSpec.create(
             self._compiled_functions[signature].func_name,
-            convert_signature_to_argument_specs(
-                signature,
-                params=self.params,
-                fixed_param_indices=self.fixed_param_indices,
-                n_positional_or_default_args=self.n_positional_or_default_args,
-            ),
+            argument_specs,
             self.return_signatures[signature],
+            shape_equalities,
         )
 
     def construct_wrapper_spec(self, signature):
@@ -1100,7 +1232,7 @@ class NumetaFunction(BaseFunction):
     def construct_wrapper(self, signature):
         wrapper_spec = self.construct_wrapper_spec(signature)
         self._pyc_extensions[signature] = PyCExtension(
-            name=wrapper_spec[0],
+            name=wrapper_spec.name,
             functions=[wrapper_spec],
             do_checks=self.do_checks,
         )
@@ -1120,13 +1252,17 @@ class NumetaFunction(BaseFunction):
 
         compiled_name = self._compiled_functions[signature].func_name
         if self._library_pyc_extension is not None:
-            for name, _args_details, _return_specs in self._library_pyc_extension.functions:
-                if name == compiled_name:
+            for wrapper_spec in self._library_pyc_extension.functions:
+                if wrapper_spec.name == compiled_name:
                     return self._library_pyc_extension
 
         return None
 
     def _compile_signature(self, signature):
+        with _directory_build_lock(self.directory):
+            return self._compile_signature_locked(signature)
+
+    def _compile_signature_locked(self, signature):
         compiled_function = self._compiled_functions[signature]
         compiled_function.validate_codegen_abi()
         if not compiled_function.compiled:

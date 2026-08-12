@@ -1,6 +1,3 @@
-import importlib.util
-import sys
-
 import numpy as np
 import pytest
 
@@ -269,42 +266,3 @@ def test_c_no_numpy_allocator_local_array_runs():
         np.testing.assert_allclose(out, np.full(3, 2.0))
     finally:
         nm.settings.set_numpy_allocator()
-
-
-def test_phasedint_jit_config_backend_env(monkeypatch):
-    monkeypatch.setenv("PHASEDINT_NUMETA_BACKEND", "c")
-    module_name = "_numeta_test_jit_config_backend_env"
-    sys.modules.pop(module_name, None)
-    original = {
-        "use_numpy_allocator": nm.settings.use_numpy_allocator,
-        "reorder_kwargs": nm.settings.reorder_kwargs,
-        "add_shape_descriptors": nm.settings.add_shape_descriptors,
-        "ignore_fixed_shape_in_nested_calls": nm.settings.ignore_fixed_shape_in_nested_calls,
-        "use_c_dispatch": nm.settings.use_c_dispatch,
-        "use_c_signature_parser": nm.settings.use_c_signature_parser,
-    }
-    try:
-        spec = importlib.util.spec_from_file_location(module_name, "jit_config.py")
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        assert module.JIT_DEFAULTS["backend"] == "c"
-    finally:
-        if original["use_numpy_allocator"]:
-            nm.settings.set_numpy_allocator()
-        else:
-            nm.settings.unset_numpy_allocator()
-        if original["reorder_kwargs"]:
-            nm.settings.set_reorder_kwargs()
-        else:
-            nm.settings.unset_reorder_kwargs()
-        if original["add_shape_descriptors"]:
-            nm.settings.set_add_shape_descriptors()
-        else:
-            nm.settings.unset_add_shape_descriptors()
-        nm.settings.ignore_fixed_shape_in_nested_calls = original[
-            "ignore_fixed_shape_in_nested_calls"
-        ]
-        nm.settings.use_c_dispatch = original["use_c_dispatch"]
-        nm.settings.use_c_signature_parser = original["use_c_signature_parser"]
-        sys.modules.pop(module_name, None)

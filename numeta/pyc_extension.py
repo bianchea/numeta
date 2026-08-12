@@ -10,11 +10,17 @@ from string import Template
 from pathlib import Path
 
 
-from .settings import settings
 from .compiler import Compiler
+from .native_abi import (
+    NUMETA_WRAPPER_ABI_VERSION,
+    codegen_abi_settings,
+    format_metadata_mismatches,
+    metadata_mismatches,
+    numpy_c_abi_version,
+)
+from .settings import settings
 
-WRAPPER_CACHE_FORMAT_VERSION = 1
-NUMETA_WRAPPER_ABI_VERSION = 1
+WRAPPER_CACHE_FORMAT_VERSION = 2
 
 
 class PyCExtension:
@@ -25,19 +31,36 @@ class PyCExtension:
         name,
         functions,
         do_checks=True,
+        function_checks=None,
     ):
         self.name = f"{name}{self.SUFFIX}"
         self.functions = functions
         self.do_checks = do_checks
+        self.function_checks = dict(function_checks or {})
         self.lib_path = None
         self.cache_info = None
 
     def set_lib_path(self, path):
         self.lib_path = path
 
-    def build_cache_info(self, compile_flags, backend=None):
+    def build_cache_info(
+        self,
+        compile_flags,
+        backend=None,
+        *,
+        compiler_identity=None,
+        simd_arch=None,
+        simd_features=(),
+    ):
         if backend is None:
             backend = settings.default_backend
+        if compiler_identity is None:
+            compiler_identity = Compiler(
+                settings.c_compiler,
+                compile_flags,
+                setting="set_c_compiler",
+                env_var="NUMETA_CC",
+            ).identity()
         return {
             "format_version": WRAPPER_CACHE_FORMAT_VERSION,
             "numeta_wrapper_abi_version": NUMETA_WRAPPER_ABI_VERSION,
@@ -45,21 +68,42 @@ class PyCExtension:
             "extension_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
             "python_version": [sys.version_info.major, sys.version_info.minor],
             "numpy_version": np.__version__,
+            "numpy_c_abi": numpy_c_abi_version(),
             "platform": platform.system(),
             "machine": platform.machine(),
             "backend": backend,
             "compile_flags": Compiler._normalize_flags(compile_flags),
+            "compiler": dict(compiler_identity),
+            "simd_arch": simd_arch,
+            "simd_features": list(simd_features),
             "wrapper_name": self.name,
             "do_checks": self.do_checks,
+            "function_checks": dict(sorted(self.function_checks.items())),
+            "codegen_settings": codegen_abi_settings(),
         }
 
-    def set_cache_info(self, compile_flags, backend=None):
-        self.cache_info = self.build_cache_info(compile_flags, backend=backend)
+    def set_cache_info(self, compile_flags, backend=None, **metadata):
+        self.cache_info = self.build_cache_info(
+            compile_flags,
+            backend=backend,
+            **metadata,
+        )
         return self.cache_info
 
-    def cache_matches(self, compile_flags, backend=None):
-        return getattr(self, "cache_info", None) == self.build_cache_info(
-            compile_flags, backend=backend
+    def cache_mismatches(self, compile_flags, backend=None, **metadata):
+        current = self.build_cache_info(
+            compile_flags,
+            backend=backend,
+            **metadata,
+        )
+        return metadata_mismatches(getattr(self, "cache_info", None), current)
+
+    def cache_matches(self, compile_flags, backend=None, **metadata):
+        return not self.cache_mismatches(compile_flags, backend=backend, **metadata)
+
+    def format_cache_mismatches(self, compile_flags, backend=None, **metadata) -> str:
+        return format_metadata_mismatches(
+            self.cache_mismatches(compile_flags, backend=backend, **metadata)
         )
 
     def compile(
@@ -70,17 +114,14 @@ class PyCExtension:
         compile_flags,
         backend=None,
         runtime_rpath=None,
+        simd_arch=None,
+        simd_features=(),
     ):
         if self.lib_path is not None:
             return self.lib_path
 
         if backend is None:
             backend = settings.default_backend
-
-        self.set_cache_info(compile_flags, backend=backend)
-
-        wrapper_src = Path(directory) / f"{self.name}.c"
-        self.write(wrapper_src)
 
         if backend == "fortran":
             libraries = [
@@ -105,6 +146,17 @@ class PyCExtension:
             setting="set_c_compiler",
             env_var="NUMETA_CC",
         )
+        self.set_cache_info(
+            compile_flags,
+            backend=backend,
+            compiler_identity=compiler.identity(),
+            simd_arch=simd_arch,
+            simd_features=simd_features,
+        )
+
+        wrapper_src = Path(directory) / f"{self.name}.c"
+        self.write(wrapper_src)
+
         lib = compiler.compile_to_library(
             self.name,
             [wrapper_src],
@@ -196,7 +248,14 @@ PyMODINIT_FUNC PyInit_${name}(void) {
                 )
             )
 
-            procedure_definitions.append(self.construct_procedure(name, args_details, return_specs))
+            procedure_definitions.append(
+                self.construct_procedure(
+                    name,
+                    args_details,
+                    return_specs,
+                    do_checks=self.function_checks.get(name, self.do_checks),
+                )
+            )
 
         substitutions["module_procedures"] = "\n".join(module_procedures)
         substitutions["procedure_definitions"] = "\n".join(procedure_definitions)
@@ -207,7 +266,7 @@ PyMODINIT_FUNC PyInit_${name}(void) {
 
         return module_template
 
-    def construct_procedure(self, name, args_details, return_specs):
+    def construct_procedure(self, name, args_details, return_specs, *, do_checks=None):
         template = """
 void ${fortran_name}(${fortran_args});
 
@@ -249,7 +308,7 @@ static PyObject* ${procedure_name}(PyObject *self, PyObject *const *args, Py_ssi
         )
 
         substitutions["checks"] = ""
-        if self.do_checks:
+        if self.do_checks if do_checks is None else do_checks:
             substitutions["checks"] = "\n    ".join([self.get_check(var) for var in args])
 
         call_args = [self.get_call_args(var) for var in args]

@@ -21,6 +21,11 @@ from .signature import (
     parse_function_parameters,
 )
 from .native_name_registry import native_name_registry
+from .native_abi import (
+    codegen_abi_settings,
+    format_metadata_mismatches,
+    metadata_mismatches,
+)
 
 
 @dataclass
@@ -90,6 +95,8 @@ class NumetaCompiledFunction(ExternalLibrary):
         self.compile_flags = Compiler._normalize_flags(resolved_flags)
         self.compiled = False
         self._source_files = []
+        self._compiler_identity = None
+        self._codegen_abi_settings = codegen_abi_settings()
 
     @property
     def library_name(self):
@@ -171,6 +178,18 @@ class NumetaCompiledFunction(ExternalLibrary):
             self._source_files = [source_path]
         return source_path
 
+    def validate_codegen_abi(self) -> None:
+        """Reject compiling a target under settings different from construction."""
+        current = codegen_abi_settings()
+        mismatches = metadata_mismatches(self._codegen_abi_settings, current)
+        if mismatches:
+            from .exceptions import IncompatibleLibraryError
+
+            details = format_metadata_mismatches(mismatches)
+            raise IncompatibleLibraryError(
+                f"Native target ABI settings mismatch for {self.func_name!r}: {details}"
+            )
+
     def adopt_compiled_state(self, replacement: "NumetaCompiledFunction") -> None:
         """Adopt replacement state while preserving this object's identity."""
         if not isinstance(replacement, NumetaCompiledFunction):
@@ -189,6 +208,12 @@ class NumetaCompiledFunction(ExternalLibrary):
         self.compile_flags = replacement.compile_flags
         self.backend = replacement.backend
         self._requires_math = getattr(replacement, "_requires_math", False)
+        self._compiler_identity = getattr(replacement, "_compiler_identity", None)
+        self._codegen_abi_settings = getattr(
+            replacement,
+            "_codegen_abi_settings",
+            codegen_abi_settings(),
+        )
         self.compiled = replacement.compiled
 
     def __setstate__(self, state):
@@ -218,6 +243,10 @@ class NumetaCompiledFunction(ExternalLibrary):
             self.c_linkage = None
         if not hasattr(self, "emit_mode"):
             self.emit_mode = None
+        if not hasattr(self, "_compiler_identity"):
+            self._compiler_identity = None
+        if not hasattr(self, "_codegen_abi_settings"):
+            self._codegen_abi_settings = codegen_abi_settings()
 
     @property
     def obj_files(self):
@@ -260,6 +289,7 @@ class NumetaCompiledFunction(ExternalLibrary):
         """
         Compile source files using the selected backend and return the object file.
         """
+        self.validate_codegen_abi()
         if self._obj_files is None:
             obj_name = self.func_name
             if self.backend == "fortran":
@@ -294,6 +324,8 @@ class NumetaCompiledFunction(ExternalLibrary):
                 obj_suffix = "_c.o"
             else:
                 raise ValueError(f"Unsupported backend: {self.backend}")
+
+            self._compiler_identity = compiler.identity()
 
             for lib in self.symbolic_function.get_dependencies().values():
 
@@ -1072,17 +1104,21 @@ class NumetaFunction(BaseFunction):
         return None
 
     def _compile_signature(self, signature):
-        if not self._compiled_functions[signature].compiled:
-            self._compiled_functions[signature].compile()
+        compiled_function = self._compiled_functions[signature]
+        compiled_function.validate_codegen_abi()
+        if not compiled_function.compiled:
+            compiled_function.compile()
 
         pyc_extension = self.get_pyc_extension(signature)
         if pyc_extension.lib_path is None:
             pyc_extension.compile(
-                core_lib_name=self._compiled_functions[signature].library_name,
-                core_lib_path=self._compiled_functions[signature].path,
+                core_lib_name=compiled_function.library_name,
+                core_lib_path=compiled_function.path,
                 directory=self.directory,
                 compile_flags=self.compile_flags,
                 backend=self.backend,
+                simd_arch=self.simd_arch,
+                simd_features=self.simd_features,
             )
 
     def compile(self, signature):

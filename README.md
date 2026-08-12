@@ -419,9 +419,11 @@ lib_loaded["add"](array)
 Bundles contain trusted executable code and must only be loaded from trusted
 sources. They are intentionally native and strict: Numeta validates Linux machine
 architecture, Python SOABI, NumPy C ABI, wrapper ABI, shared-library availability,
-checksums, and CPU features when `-march=native` was used. Rebuild the bundle after
-an environment mismatch. Pickle libraries from Numeta 0.5 and earlier are never
-deserialized and must be rebuilt from source.
+checksums, and CPU features when `-march=native` was used. Numeta also rejects reuse
+when shape descriptors, nested fixed-shape handling, NumPy allocation ownership, or
+keyword ordering differ from the build configuration. The manifest records compiler
+identity, flags, backend, SIMD target, and argument-checking policy for each artifact.
+Rebuild the bundle after a compatibility mismatch.
 
 Loaded libraries can also incrementally replace already-compiled specializations.
 The replacement keeps the old exported symbol names, recompiles only the live
@@ -474,9 +476,9 @@ Saved libraries now contain a versioned artifact manifest. Paths in the
 manifest are relative to the library directory, so the complete saved directory
 can be moved and loaded from another location. Loading reports missing persisted
 objects explicitly rather than silently selecting an unrelated object file.
-Pass `ignore_corrupt=True` to treat malformed cache metadata as a cache miss.
-Library metadata uses Python pickle, so this option does not make untrusted
-library files safe to load.
+Pass `ignore_corrupt=True` to treat a corrupt or ABI-incompatible bundle as an
+empty cache miss. Bundles still contain native executable code; this option does
+not make untrusted library files safe to load.
 
 #### Library global constants
 
@@ -739,12 +741,11 @@ I chose to use Fortran as the default backend for numeta because:
 
 While Fortran has some limitations, it allowed me to create a working prototype quickly. The C backend is also supported and can be selected when desired. I'm open to improving the generated code in both backends, so suggestions are welcome.
 
-## Upgrading to 0.6
+## Packaging and Toolchains
 
-Version 0.6 replaces pickle persistence with `.numeta` bundles. Rebuild existing
-saved libraries; automatic conversion is intentionally unavailable. `_signature`
-is now built by the packaging backend rather than during import, and compiler
-selection is configurable through settings or environment variables.
+The packaging backend builds the `_signature` extension. Compiler selection is
+configurable through Numeta settings or the `NUMETA_CC` and `NUMETA_FC` environment
+variables.
 
 ## Contributing
 

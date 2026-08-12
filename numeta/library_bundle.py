@@ -11,8 +11,6 @@ import math
 import os
 import platform
 import shutil
-import sys
-import sysconfig
 import tempfile
 import uuid
 import warnings
@@ -37,13 +35,18 @@ from .library_linking import (
     _collect_compiled_target_closure,
 )
 from .library_signature import signature_id
-from .pyc_extension import NUMETA_WRAPPER_ABI_VERSION, PyCExtension
+from .native_abi import (
+    format_metadata_mismatches,
+    metadata_mismatches,
+    native_runtime_abi,
+)
+from .pyc_extension import PyCExtension
 from .settings import settings
 from .signature import ParameterInfo
 from ._version import __version__ as NUMETA_VERSION
 
 BUNDLE_FORMAT = "numeta-library"
-BUNDLE_FORMAT_VERSION = 1
+BUNDLE_FORMAT_VERSION = 2
 
 
 def _make_persisted_procedure(name: str, arguments) -> Procedure:
@@ -383,13 +386,6 @@ def _decode_parameter(payload) -> ParameterInfo:
     )
 
 
-def _numpy_abi_version() -> int:
-    core = getattr(np, "_core", None)
-    multiarray = getattr(core, "_multiarray_umath", None)
-    getter = getattr(multiarray, "_get_ndarray_c_version", None)
-    return int(getter()) if getter is not None else 0
-
-
 def _cpu_features() -> list[str]:
     cpuinfo = Path("/proc/cpuinfo")
     if not cpuinfo.exists():
@@ -402,14 +398,7 @@ def _cpu_features() -> list[str]:
 
 
 def _runtime_abi() -> dict:
-    return {
-        "system": platform.system(),
-        "machine": platform.machine(),
-        "python_version": [sys.version_info.major, sys.version_info.minor],
-        "python_soabi": sysconfig.get_config_var("SOABI"),
-        "numpy_c_abi": _numpy_abi_version(),
-        "wrapper_abi": NUMETA_WRAPPER_ABI_VERSION,
-    }
+    return native_runtime_abi()
 
 
 def _sha256(path: Path) -> str:
@@ -613,6 +602,8 @@ def _restore_compiled_target(payload, bundle: Path):
     target.c_linkage = payload["c_linkage"]
     target.emit_mode = payload["emit_mode"]
     target._requires_math = payload["requires_math"]
+    target._compiler_identity = payload["compiler"]
+    target._codegen_abi_settings = payload["codegen_settings"]
     target.compiled = True
     target._loaded_from_bundle = True
     return target
@@ -733,16 +724,91 @@ def _validate_manifest(manifest: dict, bundle: Path) -> None:
     current_abi = _runtime_abi()
     if current_abi["system"] != "Linux":
         raise IncompatibleLibraryError("Numeta 0.6 native bundles support Linux only")
-    mismatches = {
-        key: (saved_abi.get(key), current_abi.get(key))
-        for key in current_abi
-        if saved_abi.get(key) != current_abi.get(key)
-    }
+    mismatches = metadata_mismatches(saved_abi, current_abi)
     if mismatches:
-        details = ", ".join(
-            f"{key}={saved!r} (current {current!r})" for key, (saved, current) in mismatches.items()
-        )
+        details = format_metadata_mismatches(mismatches)
         raise IncompatibleLibraryError(f"Native bundle ABI mismatch: {details}")
+
+    function_check_policies = {}
+    for function in manifest["functions"]:
+        for specialization in function.get("specializations", []):
+            function_check_policies[specialization["symbol"]] = function["do_checks"]
+    for symbol, target in manifest["targets"].items():
+        target_mismatches = metadata_mismatches(
+            target["codegen_settings"],
+            saved_abi["codegen_settings"],
+            prefix=f"targets.{symbol}.codegen_settings",
+        )
+        if target_mismatches:
+            details = format_metadata_mismatches(target_mismatches)
+            raise CorruptLibraryError(f"Native target ABI metadata mismatch: {details}")
+        expected_checks = function_check_policies.get(symbol)
+        if expected_checks is not None and target["do_checks"] != expected_checks:
+            raise CorruptLibraryError(
+                f"Native target check policy does not match function for {symbol!r}"
+            )
+
+    wrapper_relative = manifest.get("wrapper_library")
+    wrapper_cache = manifest.get("wrapper_cache_info")
+    if wrapper_relative is not None:
+        if not isinstance(wrapper_cache, dict):
+            raise CorruptLibraryError("Native bundle wrapper has no cache metadata")
+        required_wrapper_fields = {
+            "backend",
+            "compile_flags",
+            "compiler",
+            "simd_arch",
+            "simd_features",
+            "do_checks",
+            "function_checks",
+            "numpy_version",
+        }
+        missing_fields = sorted(required_wrapper_fields.difference(wrapper_cache))
+        if missing_fields:
+            raise CorruptLibraryError(
+                "Native wrapper cache metadata is missing: " + ", ".join(missing_fields)
+            )
+        expected_function_checks = {
+            specialization["symbol"]: function["do_checks"]
+            for function in manifest["functions"]
+            for specialization in function.get("specializations", [])
+        }
+        if wrapper_cache["function_checks"] != expected_function_checks:
+            raise CorruptLibraryError(
+                "Native wrapper check policies do not match persisted functions"
+            )
+
+        expected_wrapper = PyCExtension(
+            name=manifest.get("name"),
+            functions=[],
+            do_checks=wrapper_cache["do_checks"],
+            function_checks=wrapper_cache["function_checks"],
+        ).build_cache_info(
+            wrapper_cache["compile_flags"],
+            backend=wrapper_cache["backend"],
+            compiler_identity=wrapper_cache["compiler"],
+            simd_arch=wrapper_cache["simd_arch"],
+            simd_features=wrapper_cache["simd_features"],
+        )
+        compatibility_fields = (
+            "format_version",
+            "numeta_wrapper_abi_version",
+            "python_soabi",
+            "extension_suffix",
+            "python_version",
+            "numpy_c_abi",
+            "platform",
+            "machine",
+            "wrapper_name",
+            "codegen_settings",
+        )
+        wrapper_mismatches = metadata_mismatches(
+            {key: wrapper_cache.get(key) for key in compatibility_fields},
+            {key: expected_wrapper[key] for key in compatibility_fields},
+        )
+        if wrapper_mismatches:
+            details = format_metadata_mismatches(wrapper_mismatches)
+            raise IncompatibleLibraryError(f"Native wrapper cache mismatch: {details}")
 
     required_features = set(manifest.get("required_cpu_features", []))
     missing_features = required_features.difference(_cpu_features())
@@ -794,6 +860,8 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
                 library._global_entries,
             )
             targets = _collect_compiled_target_closure(roots, active_targets)
+            for target in targets:
+                target.validate_codegen_abi()
 
             procedures_infos = []
             for function in library._entries.values():
@@ -803,6 +871,21 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
             from .numeta_function import NumetaFunction
 
             procedures_infos = NumetaFunction._deduplicate_wrapper_specs(procedures_infos)
+            wrapped_functions = [
+                function for function in library._entries.values() if function._compiled_functions
+            ]
+            wrapper_function_checks = {
+                compiled.func_name: function.do_checks
+                for function in wrapped_functions
+                for compiled in function._compiled_functions.values()
+            }
+            wrapper_check_policies = set(wrapper_function_checks.values())
+            wrapper_do_checks = next(
+                iter(wrapper_check_policies),
+                settings.default_do_checks,
+            )
+            if len(wrapper_check_policies) > 1:
+                wrapper_do_checks = settings.default_do_checks
             resolved_flags = (
                 settings.default_compile_flags if compile_flags is None else compile_flags
             )
@@ -835,6 +918,7 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
                     target._obj_files,
                     list(getattr(target, "_source_files", [])),
                     target.library_name,
+                    getattr(target, "_compiler_identity", None),
                 )
                 for target in targets
             }
@@ -912,17 +996,40 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
 
             wrapper = None
             if procedures_infos:
-                wrapper = PyCExtension(name=name, functions=procedures_infos)
-                wrapper_backend = next(iter(library._entries.values())).backend
-                wrapper_flags = next(iter(library._entries.values())).compile_flags
+                wrapper = PyCExtension(
+                    name=name,
+                    functions=procedures_infos,
+                    do_checks=wrapper_do_checks,
+                    function_checks=wrapper_function_checks,
+                )
+                wrapper_backend = "fortran" if "fortran" in compiled_backends else "c"
+                simd_configurations = {
+                    (
+                        getattr(target, "simd_arch", settings.default_simd_arch),
+                        tuple(
+                            getattr(
+                                target,
+                                "simd_features",
+                                settings.default_simd_features,
+                            )
+                        ),
+                    )
+                    for target in targets
+                }
+                if len(simd_configurations) == 1:
+                    wrapper_simd_arch, wrapper_simd_features = next(iter(simd_configurations))
+                else:
+                    wrapper_simd_arch, wrapper_simd_features = None, ()
                 with _timing_phase(timing_callback, "save.wrapper", reused=False):
                     wrapper.compile(
                         core_lib_name=name,
                         core_lib_path=libraries_dir,
                         directory=libraries_dir,
-                        compile_flags=wrapper_flags,
+                        compile_flags=resolved_flags,
                         backend=wrapper_backend,
                         runtime_rpath="$ORIGIN",
+                        simd_arch=wrapper_simd_arch,
+                        simd_features=wrapper_simd_features,
                     )
 
             target_payloads = {}
@@ -942,6 +1049,9 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
                     "c_linkage": getattr(target, "c_linkage", None),
                     "emit_mode": getattr(target, "emit_mode", None),
                     "requires_math": bool(getattr(target, "_requires_math", False)),
+                    "compiler": getattr(target, "_compiler_identity", None)
+                    or compiler_info[target.backend],
+                    "codegen_settings": target._codegen_abi_settings,
                     "arguments": [
                         _serialize_argument(argument)
                         for argument in getattr(target.symbolic_function, "arguments", {}).values()
@@ -1034,6 +1144,7 @@ def save_library_bundle(library, directory, compile_flags=None, timing_callback=
                     target._obj_files,
                     target._source_files,
                     target.library_name,
+                    target._compiler_identity,
                 ) = snapshot
             raise
 
@@ -1119,6 +1230,8 @@ def load_library_bundle(
             wrapper = PyCExtension(
                 name=name,
                 functions=NumetaFunction._deduplicate_wrapper_specs(wrapper_specs),
+                do_checks=manifest["wrapper_cache_info"]["do_checks"],
+                function_checks=manifest["wrapper_cache_info"]["function_checks"],
             )
             wrapper.cache_info = manifest.get("wrapper_cache_info")
             wrapper.set_lib_path(_resolve_bundle_path(bundle, wrapper_relative))

@@ -11,6 +11,8 @@ from .exceptions import CompilationError, ToolchainNotFoundError
 
 
 class Compiler:
+    _identity_cache: dict[tuple, dict] = {}
+
     def __init__(
         self,
         compiler,
@@ -82,12 +84,23 @@ class Compiler:
 
     def identity(self) -> dict:
         """Return compiler provenance without applying user compile flags."""
+        compiler_path = Path(self.compiler)
+        try:
+            stat = compiler_path.stat()
+            cache_key = (self.compiler, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = (self.compiler, None, None)
+        cached = self._identity_cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
         result = self.run_command([self.compiler, "--version"], cwd=Path.cwd())
         first_line = result.stdout.splitlines()[:1]
-        return {
+        identity = {
             "executable": self.compiler,
             "version": first_line[0] if first_line else "unknown",
         }
+        self._identity_cache[cache_key] = identity
+        return identity.copy()
 
     def build_obj_command(
         self,

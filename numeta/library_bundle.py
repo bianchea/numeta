@@ -42,7 +42,7 @@ from .native_abi import (
 )
 from .pyc_extension import PyCExtension
 from .settings import settings
-from .signature import ParameterInfo
+from .signature import ParameterInfo, Signature
 from ._version import __version__ as NUMETA_VERSION
 
 BUNDLE_FORMAT = "numeta-library"
@@ -651,8 +651,9 @@ def _restore_function(payload, targets, bundle: Path):
         "_fast_call": {},
         "_use_c_dispatch_instance": payload["use_c_dispatch"],
     }
+    signature_type = Signature if any(param.is_comptime for param in state["params"]) else tuple
     for specialization in payload["specializations"]:
-        signature = _decode_value(specialization["signature"])
+        signature = signature_type(_decode_value(specialization["signature"]))
         if signature_id(signature) != specialization["signature_id"]:
             raise CorruptLibraryError(
                 f"Signature identifier mismatch for function {payload['name']!r}"

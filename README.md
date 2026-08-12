@@ -342,6 +342,10 @@ call `save()` when the precompiled specialization must be reused by another
 process. Loaded bundles retain the same inspection data; creating a new signature
 requires reattaching the Python implementation first.
 
+Comptime specialization identity includes the exact value type. For example, Python
+`int`, `bool`, and NumPy integer scalars with equal numeric values produce distinct
+specializations.
+
 For several signatures, build one callable bundle without compiling an individual
 wrapper for each specialization:
 

@@ -12,6 +12,46 @@ from .ast import Variable
 from .ast.expressions import ExpressionNode, GetAttr, GetItem
 from .types_hint import comptime
 
+SIGNATURE_IDENTITY_VERSION = 1
+
+
+def _type_aware_equal(left, right) -> bool:
+    """Compare signature values without Python's cross-type numeric equality."""
+    if left is right:
+        return True
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(
+            _type_aware_equal(left_item, right_item) for left_item, right_item in zip(left, right)
+        )
+    if type(left) is not type(right):
+        return False
+    try:
+        result = left == right
+        return bool(result)
+    except (TypeError, ValueError):
+        return False
+
+
+class Signature(tuple):
+    """Tuple-compatible cache key with type-aware value equality."""
+
+    __slots__ = ()
+    __hash__ = tuple.__hash__
+
+    def __new__(cls, values=()):
+        if isinstance(values, cls):
+            return values
+        return super().__new__(cls, values)
+
+    def __eq__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return _type_aware_equal(self, other)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return NotImplemented if result is NotImplemented else not result
+
 
 def _init_signature_module():
     """Initialize the packaged signature accelerator when it is available."""
@@ -23,7 +63,10 @@ def _init_signature_module():
         return None, False
 
     required = ("BaseFunction", "fast_dispatch", "get_signature_and_runtime_args", "init_globals")
-    if not all(hasattr(_signature, name) for name in required):
+    if (
+        not all(hasattr(_signature, name) for name in required)
+        or getattr(_signature, "SIGNATURE_IDENTITY_VERSION", 0) != SIGNATURE_IDENTITY_VERSION
+    ):
         return None, False
 
     types_dict = {
@@ -37,6 +80,7 @@ def _init_signature_module():
         "SCALAR": SCALAR,
         "UNKNOWN": UNKNOWN,
         "NumpyGeneric": np.generic,
+        "Signature": Signature,
     }
 
     constants_dict = {
@@ -297,8 +341,9 @@ def _get_signature_and_runtime_args_py(
 
     runtime_args = []
     signature = [None] * n_positional_or_default_args
+    has_comptime = False
 
-    unused_kwargs = kwargs
+    unused_kwargs = dict(kwargs)
     pos_idx = 0
 
     for fi, param_idx in enumerate(fixed_param_indices):
@@ -326,6 +371,7 @@ def _get_signature_and_runtime_args_py(
                 raise ValueError(f"Missing required argument: {param.name}")
 
         if param.is_comptime:
+            has_comptime = True
             signature[fi] = arg
         else:
             signature[fi] = get_signature_from_arg(arg, param.name)
@@ -347,7 +393,8 @@ def _get_signature_and_runtime_args_py(
         signature.append(get_signature_from_arg(arg, name))
         runtime_args.append(arg)
 
-    return to_execute, tuple(signature), runtime_args
+    signature_type = Signature if has_comptime else tuple
+    return to_execute, signature_type(signature), runtime_args
 
 
 def convert_signature_to_argument_specs(

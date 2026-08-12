@@ -297,7 +297,11 @@ class NumetaLibrary:
             selected_signatures = old_signatures
             preserve_unselected = False
         else:
-            selected_signatures = tuple(dict.fromkeys(signatures))
+            selected_signatures = tuple(
+                dict.fromkeys(
+                    self._resolve_signature_reference(name, signature) for signature in signatures
+                )
+            )
             if not selected_signatures:
                 raise ValueError("signatures must contain at least one specialization")
 
@@ -472,7 +476,7 @@ class NumetaLibrary:
     def _resolve_signature_reference(self, name: str, signature):
         if isinstance(signature, str) and signature.startswith(f"sig-v{SIGNATURE_ID_VERSION}-"):
             return self.signature_from_id(name, signature)
-        return signature
+        return self._entries[name]._coerce_signature(signature)
 
     def _compiled_target_for_symbol(
         self,

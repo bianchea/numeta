@@ -15,6 +15,7 @@ from .pyc_extension import PyCExtension
 from .array_shape import ArrayShape, SCALAR, UNKNOWN
 from .external_library import ExternalLibrary
 from .signature import (
+    Signature,
     convert_signature_to_argument_specs,
     fast_dispatch,
     get_signature_and_runtime_args,
@@ -417,7 +418,11 @@ class NumetaCompiledFunction(ExternalLibrary):
 
 
 try:
-    from ._signature import BaseFunction
+    from . import _signature as _dispatch_module
+
+    if getattr(_dispatch_module, "SIGNATURE_IDENTITY_VERSION", 0) != 1:
+        raise ImportError("incompatible Numeta signature accelerator")
+    BaseFunction = _dispatch_module.BaseFunction
 
     _c_dispatch_base_available = True
 except ImportError:
@@ -572,7 +577,9 @@ class NumetaFunction(BaseFunction):
             selected_signatures.update(self._pyc_extensions)
             selected_signatures.update(self._fast_call)
         else:
-            selected_signatures = tuple(dict.fromkeys(signatures))
+            selected_signatures = tuple(
+                dict.fromkeys(self._coerce_signature(signature) for signature in signatures)
+            )
 
         released_names = []
         for signature in selected_signatures:
@@ -626,6 +633,11 @@ class NumetaFunction(BaseFunction):
         )
         return signature
 
+    def _coerce_signature(self, signature):
+        has_comptime = any(self.params[index].is_comptime for index in self.fixed_param_indices)
+        signature_type = Signature if has_comptime else tuple
+        return signature_type(signature)
+
     def _normalize_specialization_signature(self, signature):
         """Match symbolic NumPy type tokens to runtime ``numpy.dtype`` keys."""
         normalized = []
@@ -641,7 +653,7 @@ class NumetaFunction(BaseFunction):
                 if isinstance(dtype_token, type) and issubclass(dtype_token, np.generic):
                     item = (item[0], np.dtype(dtype_token), *item[2:])
             normalized.append(item)
-        return tuple(normalized)
+        return self._coerce_signature(normalized)
 
     def specialize(self, *args, **kwargs):
         """Construct and return a specialization without compiling or executing it."""

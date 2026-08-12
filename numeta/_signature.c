@@ -18,6 +18,7 @@ static PyObject *SCALAR = NULL;
 static PyObject *UNKNOWN = NULL;
 static PyObject *INSPECT_EMPTY = NULL;
 static PyObject *NumpyGeneric = NULL;
+static PyObject *Signature = NULL;
 
 // Globals for strings - interned for speed
 static PyObject *str_kind = NULL;
@@ -439,6 +440,7 @@ typedef struct {
 
 typedef struct {
     int to_execute;
+    int has_comptime;
     PyObject *sig_tuple;        // New reference (tuple)
     PyObject **runtime_args_buf; // C array of new refs (caller must DECREF)
     Py_ssize_t nruntime;
@@ -460,6 +462,7 @@ static int _parse_signature_core(ParseInput *input, ParseResult *out,
     Settings *settings = &input->settings;
 
     int to_execute = 1;
+    int has_comptime = 0;
 
     Py_ssize_t args_len = PyTuple_Size(py_args);
     Py_ssize_t num_fixed = PyList_Size(fixed_param_indices);
@@ -572,6 +575,7 @@ static int _parse_signature_core(ParseInput *input, ParseResult *out,
         }
 
         if (is_comptime) {
+            has_comptime = 1;
             PyList_SET_ITEM(signature, sig_idx++, arg);
         } else {
             PyObject *sig_item = get_signature_from_arg(arg, p_name, &to_execute, settings);
@@ -638,16 +642,27 @@ skip_decref_arg:
         PyList_SetSlice(signature, sig_idx, total_sig_size, NULL);
     }
 
-    PyObject *sig_tuple = PyList_AsTuple(signature);
+    PyObject *raw_sig_tuple = PyList_AsTuple(signature);
     Py_DECREF(signature);
-    if (!sig_tuple) {
+    if (!raw_sig_tuple) {
         // Clean up runtime_args_buf refs
         for (Py_ssize_t i = 0; i < nruntime; i++) Py_DECREF(runtime_args_buf[i]);
         if (heap_buf) PyMem_Free(heap_buf);
         return -1;
     }
+    PyObject *sig_tuple = raw_sig_tuple;
+    if (has_comptime) {
+        sig_tuple = PyObject_CallOneArg(Signature, raw_sig_tuple);
+        Py_DECREF(raw_sig_tuple);
+        if (!sig_tuple) {
+            for (Py_ssize_t i = 0; i < nruntime; i++) Py_DECREF(runtime_args_buf[i]);
+            if (heap_buf) PyMem_Free(heap_buf);
+            return -1;
+        }
+    }
 
     out->to_execute = to_execute;
+    out->has_comptime = has_comptime;
     out->sig_tuple = sig_tuple;
     out->runtime_args_buf = runtime_args_buf;
     out->nruntime = nruntime;
@@ -1035,13 +1050,22 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
             PyObject **sig = sig_buf;
             
             // Build signature tuple
-            PyObject *sig_tuple = PyTuple_New(parsed_nargs);
-            if (!sig_tuple) {
+            PyObject *raw_sig_tuple = PyTuple_New(parsed_nargs);
+            if (!raw_sig_tuple) {
                 Py_XDECREF(tmp_kwargs);
                 return NULL;
             }
             for (int i = 0; i < parsed_nargs; i++) {
-                PyTuple_SET_ITEM(sig_tuple, i, sig[i]);  // Steals reference
+                PyTuple_SET_ITEM(raw_sig_tuple, i, sig[i]);  // Steals reference
+            }
+            PyObject *sig_tuple = raw_sig_tuple;
+            if (parsed_nruntime < parsed_nargs) {
+                sig_tuple = PyObject_CallOneArg(Signature, raw_sig_tuple);
+                Py_DECREF(raw_sig_tuple);
+                if (!sig_tuple) {
+                    Py_XDECREF(tmp_kwargs);
+                    return NULL;
+                }
             }
             
             // Lookup compiled function
@@ -1224,6 +1248,7 @@ static PyObject *init_globals(PyObject *self, PyObject *args) {
     LOAD_TYPE(SCALAR);
     LOAD_TYPE(UNKNOWN);
     LOAD_TYPE(NumpyGeneric);
+    LOAD_TYPE(Signature);
     #undef LOAD_TYPE
 
     PyObject *tmp;
@@ -1292,6 +1317,10 @@ PyMODINIT_FUNC PyInit__signature(void) {
     Py_INCREF(&BaseFunctionType);
     if (PyModule_AddObject(m, "BaseFunction", (PyObject *)&BaseFunctionType) < 0) {
         Py_DECREF(&BaseFunctionType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    if (PyModule_AddIntConstant(m, "SIGNATURE_IDENTITY_VERSION", 1) < 0) {
         Py_DECREF(m);
         return NULL;
     }

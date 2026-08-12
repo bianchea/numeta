@@ -42,7 +42,7 @@ from .native_abi import (
 )
 from .pyc_extension import PyCExtension
 from .settings import settings
-from .signature import ParameterInfo, Signature
+from .signature import ParameterInfo, Signature, validate_comptime_signature
 from ._version import __version__ as NUMETA_VERSION
 
 BUNDLE_FORMAT = "numeta-library"
@@ -496,6 +496,11 @@ def _serialize_external(dependency, stage: Path) -> tuple[str, dict, list[Path]]
 def _serialize_function(function) -> dict:
     specializations = []
     for signature, compiled in function._compiled_functions.items():
+        validate_comptime_signature(
+            signature,
+            params=function.params,
+            fixed_param_indices=function.fixed_param_indices,
+        )
         specializations.append(
             {
                 "signature": _encode_value(signature),
@@ -654,6 +659,16 @@ def _restore_function(payload, targets, bundle: Path):
     signature_type = Signature if any(param.is_comptime for param in state["params"]) else tuple
     for specialization in payload["specializations"]:
         signature = signature_type(_decode_value(specialization["signature"]))
+        try:
+            validate_comptime_signature(
+                signature,
+                params=state["params"],
+                fixed_param_indices=state["fixed_param_indices"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise CorruptLibraryError(
+                f"Invalid comptime signature for function {payload['name']!r}: {exc}"
+            ) from exc
         if signature_id(signature) != specialization["signature_id"]:
             raise CorruptLibraryError(
                 f"Signature identifier mismatch for function {payload['name']!r}"

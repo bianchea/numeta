@@ -346,6 +346,12 @@ Comptime specialization identity includes the exact value type. For example, Pyt
 `int`, `bool`, and NumPy integer scalars with equal numeric values produce distinct
 specializations.
 
+Comptime values must be stable, immutable cache keys: use `None`, `bool`, `int`,
+finite `float`/`complex`, `str`, NumPy scalars with stable Python representations,
+NumPy dtypes/scalar types, Numeta dtype or pointer descriptors, slices, or nested
+tuples of those values. Mutable containers, arrays, custom objects, and non-finite
+numbers are rejected before dispatch with the parameter name in the error.
+
 For several signatures, build one callable bundle without compiling an individual
 wrapper for each specialization:
 

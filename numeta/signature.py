@@ -1,4 +1,5 @@
 import inspect
+import math
 import sysconfig
 from dataclasses import dataclass
 from typing import Any
@@ -6,13 +7,85 @@ from typing import Any
 import numpy as np
 
 from .array_shape import ArrayShape, SCALAR, UNKNOWN
-from .datatype import DataType, ArrayType, PointerType, get_datatype
+from .datatype import DataType, DataTypeMeta, ArrayType, PointerType, get_datatype
 from .settings import settings
 from .ast import Variable
 from .ast.expressions import ExpressionNode, GetAttr, GetItem
 from .types_hint import comptime
 
 SIGNATURE_IDENTITY_VERSION = 1
+SIGNATURE_VALIDATION_VERSION = 1
+
+_SUPPORTED_COMPTIME_VALUES = (
+    "None, exact Python bool/int/float/complex/str values, NumPy scalars with stable "
+    "Python representations, NumPy dtypes and scalar types, Numeta dtypes and pointer "
+    "descriptors, slices, and tuples containing only supported values"
+)
+
+
+def validate_comptime_value(value, parameter_name: str) -> None:
+    """Reject comptime values that cannot form stable, reproducible cache keys."""
+
+    def location(path):
+        return f"Comptime argument {parameter_name!r}{path}"
+
+    def reject(item, path, reason=None):
+        value_type = f"{type(item).__module__}.{type(item).__qualname__}"
+        detail = f" ({reason})" if reason else ""
+        raise TypeError(
+            f"{location(path)} has unsupported type {value_type}{detail}; "
+            f"supported values are {_SUPPORTED_COMPTIME_VALUES}"
+        )
+
+    def validate(item, path=""):
+        if item is None or type(item) in (bool, int, str):
+            return
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{location(path)} must be finite")
+            return
+        if type(item) is complex:
+            if not math.isfinite(item.real) or not math.isfinite(item.imag):
+                raise ValueError(f"{location(path)} must have finite real and imaginary parts")
+            return
+        if type(item) is tuple:
+            for index, nested in enumerate(item):
+                validate(nested, f"{path}[{index}]")
+            return
+        if type(item) is slice:
+            validate(item.start, f"{path}.start")
+            validate(item.stop, f"{path}.stop")
+            validate(item.step, f"{path}.step")
+            return
+        if isinstance(item, np.dtype):
+            return
+        if isinstance(item, np.generic):
+            scalar_value = item.item()
+            if isinstance(scalar_value, np.generic):
+                reject(item, path, "the scalar has no stable Python representation")
+            validate(scalar_value, path)
+            return
+        if isinstance(item, DataTypeMeta) or type(item) is PointerType:
+            return
+        if isinstance(item, type) and (
+            item in (bool, int, float, complex, str) or issubclass(item, np.generic)
+        ):
+            return
+        reject(item, path)
+
+    validate(value)
+    try:
+        hash(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Comptime argument {parameter_name!r} must be hashable") from exc
+
+
+def validate_comptime_signature(signature, *, params, fixed_param_indices) -> None:
+    """Validate the comptime positions in a parsed or explicitly supplied signature."""
+    for signature_index, parameter_index in enumerate(fixed_param_indices):
+        parameter = params[parameter_index]
+        if parameter.is_comptime and signature_index < len(signature):
+            validate_comptime_value(signature[signature_index], parameter.name)
 
 
 def _type_aware_equal(left, right) -> bool:
@@ -66,6 +139,7 @@ def _init_signature_module():
     if (
         not all(hasattr(_signature, name) for name in required)
         or getattr(_signature, "SIGNATURE_IDENTITY_VERSION", 0) != SIGNATURE_IDENTITY_VERSION
+        or getattr(_signature, "SIGNATURE_VALIDATION_VERSION", 0) != SIGNATURE_VALIDATION_VERSION
     ):
         return None, False
 
@@ -81,6 +155,7 @@ def _init_signature_module():
         "UNKNOWN": UNKNOWN,
         "NumpyGeneric": np.generic,
         "Signature": Signature,
+        "ValidateComptimeValue": validate_comptime_value,
     }
 
     constants_dict = {
@@ -371,6 +446,7 @@ def _get_signature_and_runtime_args_py(
                 raise ValueError(f"Missing required argument: {param.name}")
 
         if param.is_comptime:
+            validate_comptime_value(arg, param.name)
             has_comptime = True
             signature[fi] = arg
         else:

@@ -19,6 +19,7 @@ static PyObject *UNKNOWN = NULL;
 static PyObject *INSPECT_EMPTY = NULL;
 static PyObject *NumpyGeneric = NULL;
 static PyObject *Signature = NULL;
+static PyObject *ValidateComptimeValue = NULL;
 
 // Globals for strings - interned for speed
 static PyObject *str_kind = NULL;
@@ -575,6 +576,15 @@ static int _parse_signature_core(ParseInput *input, ParseResult *out,
         }
 
         if (is_comptime) {
+            PyObject *validation = PyObject_CallFunctionObjArgs(
+                ValidateComptimeValue, arg, p_name, NULL
+            );
+            if (!validation) {
+                Py_DECREF(arg);
+                Py_DECREF(p_kind); Py_DECREF(p_name); Py_DECREF(p_default); Py_DECREF(p_is_comptime);
+                goto error;
+            }
+            Py_DECREF(validation);
             has_comptime = 1;
             PyList_SET_ITEM(signature, sig_idx++, arg);
         } else {
@@ -1048,6 +1058,37 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
             // Parser succeeded
             PyObject **runtime_args = stack_buf;
             PyObject **sig = sig_buf;
+
+            // Validate comptime items before hashing the signature for cache lookup.
+            for (int i = 0; i < parsed_nargs; i++) {
+                PyObject *param = PyList_GetItem(self->params, i);
+                PyObject *p_is_comptime = PyObject_GetAttr(param, str_is_comptime);
+                if (!p_is_comptime) {
+                    for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
+                    Py_XDECREF(tmp_kwargs);
+                    return NULL;
+                }
+                int is_comptime = PyObject_IsTrue(p_is_comptime);
+                Py_DECREF(p_is_comptime);
+                if (is_comptime < 0) {
+                    for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
+                    Py_XDECREF(tmp_kwargs);
+                    return NULL;
+                }
+                if (is_comptime) {
+                    PyObject *p_name = PyObject_GetAttr(param, str_name);
+                    PyObject *validation = p_name ? PyObject_CallFunctionObjArgs(
+                        ValidateComptimeValue, sig[i], p_name, NULL
+                    ) : NULL;
+                    Py_XDECREF(p_name);
+                    if (!validation) {
+                        for (int j = 0; j < parsed_nargs; j++) Py_XDECREF(sig[j]);
+                        Py_XDECREF(tmp_kwargs);
+                        return NULL;
+                    }
+                    Py_DECREF(validation);
+                }
+            }
             
             // Build signature tuple
             PyObject *raw_sig_tuple = PyTuple_New(parsed_nargs);
@@ -1249,6 +1290,7 @@ static PyObject *init_globals(PyObject *self, PyObject *args) {
     LOAD_TYPE(UNKNOWN);
     LOAD_TYPE(NumpyGeneric);
     LOAD_TYPE(Signature);
+    LOAD_TYPE(ValidateComptimeValue);
     #undef LOAD_TYPE
 
     PyObject *tmp;
@@ -1321,6 +1363,10 @@ PyMODINIT_FUNC PyInit__signature(void) {
         return NULL;
     }
     if (PyModule_AddIntConstant(m, "SIGNATURE_IDENTITY_VERSION", 1) < 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
+    if (PyModule_AddIntConstant(m, "SIGNATURE_VALIDATION_VERSION", 1) < 0) {
         Py_DECREF(m);
         return NULL;
     }

@@ -20,6 +20,7 @@ from .signature import (
     fast_dispatch,
     get_signature_and_runtime_args,
     parse_function_parameters,
+    validate_comptime_signature,
 )
 from .native_name_registry import native_name_registry
 from .native_abi import (
@@ -420,7 +421,10 @@ class NumetaCompiledFunction(ExternalLibrary):
 try:
     from . import _signature as _dispatch_module
 
-    if getattr(_dispatch_module, "SIGNATURE_IDENTITY_VERSION", 0) != 1:
+    if (
+        getattr(_dispatch_module, "SIGNATURE_IDENTITY_VERSION", 0) != 1
+        or getattr(_dispatch_module, "SIGNATURE_VALIDATION_VERSION", 0) != 1
+    ):
         raise ImportError("incompatible Numeta signature accelerator")
     BaseFunction = _dispatch_module.BaseFunction
 
@@ -634,6 +638,12 @@ class NumetaFunction(BaseFunction):
         return signature
 
     def _coerce_signature(self, signature):
+        signature = tuple(signature)
+        validate_comptime_signature(
+            signature,
+            params=self.params,
+            fixed_param_indices=self.fixed_param_indices,
+        )
         has_comptime = any(self.params[index].is_comptime for index in self.fixed_param_indices)
         signature_type = Signature if has_comptime else tuple
         return signature_type(signature)
@@ -993,6 +1003,7 @@ class NumetaFunction(BaseFunction):
         forced_name: str | None = None,
         allow_existing_name: bool = False,
     ):
+        signature = self._coerce_signature(signature)
 
         if forced_name is not None:
             name = forced_name

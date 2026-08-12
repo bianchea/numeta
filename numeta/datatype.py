@@ -512,7 +512,7 @@ class char(DataType):
     _np_type = np.str_
     _fortran_type = FortranType("character", 1)
     _fortran_bind_c_type = None  # Set lazily
-    _cnp_type = "npy_str"
+    _cnp_type = "char"
     _capi_cast = staticmethod(lambda x: f"PyUnicode_AsUTF8({x})")
     _name = "char"
 

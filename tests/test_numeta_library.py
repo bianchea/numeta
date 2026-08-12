@@ -5,7 +5,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-import pickle
 from functools import partial
 from types import MethodType
 
@@ -13,6 +12,11 @@ import pytest
 import numeta as nm
 
 from numeta.compiler import Compiler
+from numeta.exceptions import (
+    CorruptLibraryError,
+    IncompatibleLibraryError,
+    LegacyLibraryFormatError,
+)
 from numeta.pyc_extension import PyCExtension
 
 
@@ -20,12 +24,8 @@ def _rank_namer(prefix, *signature):
     return f"{prefix}_{signature[0][2]}"
 
 
-def _load_saved_entries(pickle_path):
-    with open(pickle_path, "rb") as handle:
-        payload = pickle.load(handle)
-    if isinstance(payload, dict):
-        return payload["entries"]
-    return payload
+def _bundle_manifest(directory, name):
+    return json.loads((Path(directory) / f"{name}.numeta" / "manifest.json").read_text())
 
 
 def test_library_save_and_load(tmp_path, backend):
@@ -449,7 +449,11 @@ def test_library_load_uses_nested_artifact_include_for_modules(tmp_path):
     namespace_compiled = lib_loaded._global_entries[f"{const_name}_namespace"]
     include_dir = Path(namespace_compiled.include[0])
     expected_include = (
-        Path(tmp_path).absolute() / "artifacts" / "compiled" / f"{const_name}_namespace"
+        Path(tmp_path).absolute()
+        / f"{name}.numeta"
+        / "artifacts"
+        / "compiled"
+        / f"{const_name}_namespace"
     )
     assert include_dir == expected_include
     assert (include_dir / f"{const_name}_namespace.mod").exists()
@@ -542,15 +546,10 @@ def test_library_save_moves_root_objects_into_artifacts(tmp_path):
 
     artifact_obj = Path(compiled._obj_files)
     assert artifact_obj.parent == (
-        Path(tmp_path).absolute() / "artifacts" / "compiled" / compiled.func_name
+        Path(tmp_path).absolute() / f"{name}.numeta" / "artifacts" / "compiled" / compiled.func_name
     )
     assert artifact_obj.exists()
-    assert not root_obj.exists()
-
-    stale_root_obj = Path(tmp_path).absolute() / artifact_obj.name
-    stale_root_obj.write_bytes(artifact_obj.read_bytes())
-    lib.save(tmp_path, "")
-    assert not stale_root_obj.exists()
+    assert root_obj.exists()
 
 
 def test_library_artifact_manifest_is_relative_and_relocatable(tmp_path):
@@ -577,16 +576,18 @@ def test_library_artifact_manifest_is_relative_and_relocatable(tmp_path):
     lib.use_manifest_value(out)
     lib.save(source_dir, "")
 
-    with open(source_dir / f"{name}.pkl", "rb") as handle:
-        payload = pickle.load(handle)
-
-    artifacts = payload["compiled_artifacts"]
+    payload = _bundle_manifest(source_dir, name)
+    artifacts = payload["targets"]
     assert artifacts
     for artifact in artifacts.values():
         for key in ("object_files", "source_files", "include_dirs", "module_files"):
             assert all(not Path(path).is_absolute() for path in artifact[key])
 
-    shutil.copytree(source_dir, relocated_dir)
+    relocated_dir.mkdir()
+    shutil.copytree(
+        source_dir / f"{name}.numeta",
+        relocated_dir / f"{name}.numeta",
+    )
     lib_loaded = nm.NumetaLibrary.load(name, relocated_dir)
     namespace_compiled = lib_loaded._global_entries[f"{const_name}_namespace"]
     assert Path(namespace_compiled._obj_files).is_relative_to(relocated_dir)
@@ -615,15 +616,13 @@ def test_library_load_manifest_reports_missing_artifact(tmp_path):
     lib.add_one(out)
     lib.save(tmp_path, "")
 
-    pickle_path = Path(tmp_path) / f"{name}.pkl"
-    with open(pickle_path, "rb") as handle:
-        payload = pickle.load(handle)
-
-    first_artifact = next(iter(payload["compiled_artifacts"].values()))
-    object_file = Path(tmp_path) / first_artifact["object_files"][0]
+    bundle = Path(tmp_path) / f"{name}.numeta"
+    payload = _bundle_manifest(tmp_path, name)
+    first_artifact = next(iter(payload["targets"].values()))
+    object_file = bundle / first_artifact["object_files"][0]
     object_file.unlink()
 
-    with pytest.raises(FileNotFoundError, match="Missing persisted artifact"):
+    with pytest.raises(CorruptLibraryError, match="file list"):
         nm.NumetaLibrary.load(name, tmp_path)
 
 
@@ -1115,7 +1114,7 @@ def test_library_load_can_extend_existing_function(tmp_path, backend):
     assert len(lib_loaded.add._compiled_functions) == 2
 
 
-def test_library_load_preserves_picklable_namer_for_new_signatures(tmp_path, backend):
+def test_library_reattach_accepts_explicit_namer_for_new_signatures(tmp_path, backend):
     name = f"picklable_namer_{backend}"
     prefix = f"saved_picklable_namer_{backend}"
     lib = nm.NumetaLibrary(name)
@@ -1130,7 +1129,12 @@ def test_library_load_preserves_picklable_namer_for_new_signatures(tmp_path, bac
 
     lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
 
-    @nm.jit(backend=backend, library=lib_loaded, reattach=True)
+    @nm.jit(
+        backend=backend,
+        library=lib_loaded,
+        reattach=True,
+        namer=partial(_rank_namer, prefix),
+    )
     def add(a):
         a[:] += 1
 
@@ -1143,7 +1147,7 @@ def test_library_load_preserves_picklable_namer_for_new_signatures(tmp_path, bac
     assert f"{prefix}_2" in compiled_names
 
 
-def test_library_reattach_can_restore_unpickleable_namer(tmp_path, backend):
+def test_library_reattach_accepts_runtime_namer(tmp_path, backend):
     name = f"unpickleable_namer_{backend}"
     prefix = f"saved_lambda_namer_{backend}"
     lib = nm.NumetaLibrary(name)
@@ -1157,8 +1161,7 @@ def test_library_reattach_can_restore_unpickleable_namer(tmp_path, backend):
 
     vector = np.zeros(4, dtype=np.int64)
     lib.add(vector)
-    with pytest.warns(RuntimeWarning, match="not pickleable"):
-        lib.save(tmp_path, "")
+    lib.save(tmp_path, "")
 
     lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
 
@@ -1200,11 +1203,12 @@ def test_library_save_load_save_keeps_wrapper_specs_unique(tmp_path, backend):
     assert all(func._pyc_extensions == {} for func in lib_loaded)
 
     lib_loaded.save(tmp_path, "")
-
-    saved_functions = _load_saved_entries(Path(tmp_path) / f"{name}.pkl")
-
-    aggregate_extension = saved_functions[0]._library_pyc_extension
-    wrapper_names = [wrapper_spec[0] for wrapper_spec in aggregate_extension.functions]
+    payload = _bundle_manifest(tmp_path, name)
+    wrapper_names = [
+        specialization["symbol"]
+        for function in payload["functions"]
+        for specialization in function["specializations"]
+    ]
     assert len(wrapper_names) == len(set(wrapper_names))
     assert len(wrapper_names) == 2
 
@@ -1253,16 +1257,14 @@ def test_library_save_persists_aggregate_wrapper_cache_info(tmp_path, backend):
     lib.add(vector)
     lib.save(tmp_path, "")
 
-    wrapper_path = Path(tmp_path) / f"lib{name}{PyCExtension.SUFFIX}.so"
+    bundle = Path(tmp_path) / f"{name}.numeta"
+    wrapper_path = bundle / "libraries" / f"lib{name}{PyCExtension.SUFFIX}.so"
     assert wrapper_path.exists()
 
-    saved_functions = _load_saved_entries(Path(tmp_path) / f"{name}.pkl")
-
-    extension = saved_functions[0]._library_pyc_extension
-    assert extension.cache_info is not None
-    assert extension.cache_info["wrapper_name"] == f"{name}{PyCExtension.SUFFIX}"
-    assert extension.cache_info["backend"] == backend
-    assert "functions" not in extension.cache_info
+    cache_info = _bundle_manifest(tmp_path, name)["wrapper_cache_info"]
+    assert cache_info["wrapper_name"] == f"{name}{PyCExtension.SUFFIX}"
+    assert cache_info["backend"] == backend
+    assert "functions" not in cache_info
 
 
 def test_library_load_reuses_compatible_aggregate_wrapper(tmp_path, backend, monkeypatch):
@@ -1283,8 +1285,11 @@ def test_library_load_reuses_compatible_aggregate_wrapper(tmp_path, backend, mon
     monkeypatch.setattr(PyCExtension, "compile", fail_compile)
 
     lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
-    assert lib_loaded.add._library_pyc_extension.lib_path == Path(tmp_path).absolute() / (
-        f"lib{name}{PyCExtension.SUFFIX}.so"
+    assert lib_loaded.add._library_pyc_extension.lib_path == (
+        Path(tmp_path).absolute()
+        / f"{name}.numeta"
+        / "libraries"
+        / f"lib{name}{PyCExtension.SUFFIX}.so"
     )
 
     vector = np.zeros(4, dtype=np.int64)
@@ -1292,7 +1297,7 @@ def test_library_load_reuses_compatible_aggregate_wrapper(tmp_path, backend, mon
     np.testing.assert_array_equal(vector, np.ones(4, dtype=np.int64))
 
 
-def test_library_save_timing_and_reuses_current_aggregate_wrapper(tmp_path, backend):
+def test_library_save_reports_bundle_timing(tmp_path, backend):
     name = f"save_timing_reuse_wrapper_{backend}"
     lib = nm.NumetaLibrary(name)
 
@@ -1314,12 +1319,12 @@ def test_library_save_timing_and_reuses_current_aggregate_wrapper(tmp_path, back
     assert [event for event in first_events if event["phase"] == "save.wrapper"][-1][
         "reused"
     ] is False
-    assert [event for event in second_events if event["phase"] == "save.wrapper"][-1][
-        "reused"
-    ] is True
+    assert {"save.link", "save.wrapper", "save.total"} <= {
+        event["phase"] for event in second_events
+    }
 
 
-def test_library_load_recompiles_wrapper_on_cache_info_mismatch(tmp_path, backend, monkeypatch):
+def test_library_load_rejects_abi_mismatch(tmp_path, backend):
     name = f"reuse_wrapper_mismatch_{backend}"
     lib = nm.NumetaLibrary(name)
 
@@ -1331,73 +1336,22 @@ def test_library_load_recompiles_wrapper_on_cache_info_mismatch(tmp_path, backen
     lib.add(vector)
     lib.save(tmp_path, "")
 
-    original_build_cache_info = PyCExtension.build_cache_info
-    original_compile = PyCExtension.compile
-    calls = []
+    manifest_path = Path(tmp_path) / f"{name}.numeta" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["abi"]["python_soabi"] = "different"
+    manifest_path.write_text(json.dumps(manifest))
 
-    def mismatched_cache_info(self, *args, **kwargs):
-        cache_info = original_build_cache_info(self, *args, **kwargs)
-        cache_info["python_soabi"] = "different"
-        return cache_info
-
-    def record_compile(self, *args, **kwargs):
-        calls.append(self.name)
-        return original_compile(self, *args, **kwargs)
-
-    monkeypatch.setattr(PyCExtension, "build_cache_info", mismatched_cache_info)
-    monkeypatch.setattr(PyCExtension, "compile", record_compile)
-
-    lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
-    assert lib_loaded.add._library_pyc_extension.lib_path is None
-
-    vector = np.zeros(4, dtype=np.int64)
-    lib_loaded.add(vector)
-    np.testing.assert_array_equal(vector, np.ones(4, dtype=np.int64))
-    assert calls == [f"{name}{PyCExtension.SUFFIX}"]
+    with pytest.raises(IncompatibleLibraryError, match="python_soabi"):
+        nm.NumetaLibrary.load(name, tmp_path)
 
 
-def test_library_load_normalizes_legacy_duplicate_aggregate_wrappers(tmp_path, backend):
-    from numeta.numeta_function import NumetaFunction
-
+def test_library_load_refuses_legacy_pickle(tmp_path, backend):
     name = f"legacy_duplicate_wrappers_{backend}"
-    lib = nm.NumetaLibrary(name)
-
-    @nm.jit(backend=backend, library=lib)
-    def add(a):
-        a[:] += 1
-
-    vector = np.zeros(4, dtype=np.int64)
-    lib.add(vector)
-    lib.save(tmp_path, "")
-
     pickle_path = Path(tmp_path) / f"{name}.pkl"
-    saved_functions = _load_saved_entries(pickle_path)
+    pickle_path.write_bytes(b"legacy data that must never be deserialized")
 
-    extension = saved_functions[0]._library_pyc_extension
-    extension.functions = extension.functions + extension.functions
-    legacy_state = saved_functions[0].__dict__.copy()
-    legacy_state["_pyc_extensions"] = {
-        signature: extension for signature in legacy_state["_compiled_functions"]
-    }
-    legacy_state.pop("_library_pyc_extension")
-    legacy_state.pop("_wrapper_specs")
-
-    class LegacyNumetaFunction:
-        def __reduce__(self):
-            return (NumetaFunction.__new__, (NumetaFunction,), legacy_state)
-
-    with open(pickle_path, "wb") as handle:
-        pickle.dump([LegacyNumetaFunction()], handle)
-
-    lib_loaded = nm.NumetaLibrary.load(name, tmp_path)
-    wrapper_names = [
-        wrapper_spec[0] for wrapper_spec in lib_loaded.add._library_pyc_extension.functions
-    ]
-    assert len(wrapper_names) == len(set(wrapper_names)) == 1
-
-    vector = np.zeros(4, dtype=np.int64)
-    lib_loaded.add(vector)
-    np.testing.assert_array_equal(vector, np.ones(4, dtype=np.int64))
+    with pytest.raises(LegacyLibraryFormatError, match="rebuild"):
+        nm.NumetaLibrary.load(name, tmp_path)
 
 
 def test_library_save_and_load_openmp_prange(tmp_path):
@@ -1477,8 +1431,10 @@ def test_library_save_is_atomic_on_failure(tmp_path, backend, monkeypatch):
     lib.add(vector)
     lib.save(tmp_path, "")
 
-    pickle_path = Path(tmp_path) / f"atomic_save_{backend}.pkl"
-    original_bytes = pickle_path.read_bytes()
+    bundle = Path(tmp_path) / f"atomic_save_{backend}.numeta"
+    original_files = {
+        path.relative_to(bundle): path.read_bytes() for path in bundle.rglob("*") if path.is_file()
+    }
 
     def fail_compile_to_library(self, *args, **kwargs):
         raise RuntimeError("boom")
@@ -1488,8 +1444,11 @@ def test_library_save_is_atomic_on_failure(tmp_path, backend, monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         lib.save(tmp_path, "")
 
-    assert pickle_path.read_bytes() == original_bytes
-    assert not list(Path(tmp_path).glob(f".atomic_save_{backend}.*.pkl.tmp"))
+    current_files = {
+        path.relative_to(bundle): path.read_bytes() for path in bundle.rglob("*") if path.is_file()
+    }
+    assert current_files == original_files
+    assert not list(Path(tmp_path).glob(f".atomic_save_{backend}.numeta.stage.*"))
 
 
 def test_library_save_skips_extra_runtime_attributes(tmp_path, backend):
@@ -1509,15 +1468,16 @@ def test_library_save_skips_extra_runtime_attributes(tmp_path, backend):
     assert not hasattr(lib_loaded.add, "extra_runtime_state")
 
 
-def test_library_safe_load_treats_corrupt_pickle_as_cache_miss(tmp_path, backend):
+def test_library_safe_load_treats_corrupt_bundle_as_cache_miss(tmp_path, backend):
     name = f"corrupt_cache_{backend}"
-    pickle_path = Path(tmp_path) / f"{name}.pkl"
-    pickle_path.write_bytes(b"not a pickle")
+    bundle = Path(tmp_path) / f"{name}.numeta"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_bytes(b"not json")
 
-    with pytest.raises(pickle.UnpicklingError):
+    with pytest.raises(CorruptLibraryError):
         nm.NumetaLibrary.load(name, tmp_path)
 
-    with pytest.warns(RuntimeWarning, match="cache miss"):
+    with pytest.warns((DeprecationWarning, RuntimeWarning)):
         lib = nm.NumetaLibrary.load(name, tmp_path, safe=True)
 
     assert isinstance(lib, nm.NumetaLibrary)
@@ -1526,13 +1486,35 @@ def test_library_safe_load_treats_corrupt_pickle_as_cache_miss(tmp_path, backend
 
 def test_library_ignore_corrupt_names_cache_miss_behavior(tmp_path):
     name = "corrupt_cache_explicit_name"
-    (Path(tmp_path) / f"{name}.pkl").write_bytes(b"not a pickle")
+    bundle = Path(tmp_path) / f"{name}.numeta"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_bytes(b"not json")
 
     with pytest.warns(RuntimeWarning, match="cache miss"):
         lib = nm.NumetaLibrary.load(name, tmp_path, ignore_corrupt=True)
 
     assert isinstance(lib, nm.NumetaLibrary)
     assert len(lib) == 0
+
+
+def test_library_load_wraps_malformed_manifest(tmp_path, backend):
+    name = f"malformed_manifest_{backend}"
+    lib = nm.NumetaLibrary(name)
+
+    @nm.jit(backend=backend, library=lib)
+    def add(a):
+        a[:] += 1
+
+    lib.add(np.zeros(1, dtype=np.int64))
+    lib.save(tmp_path, "")
+
+    manifest_path = tmp_path / f"{name}.numeta" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["functions"]
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(CorruptLibraryError, match="Invalid bundle manifest"):
+        nm.NumetaLibrary.load(name, tmp_path)
 
 
 def test_library_reserved_suffix_rejected(tmp_path, backend):

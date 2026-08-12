@@ -15,6 +15,7 @@ from .datatype import (
     c_ptr,
     Vector,
     VectorType,
+    ArrayType,
     PointerType,
     ptr,
     make_vector_type,
@@ -52,8 +53,97 @@ from .fortran.external_modules import iso_c, omp
 from .jit import c_function_attributes, jit
 from .c.emitter import CTranslationUnit
 from .numeta_library import NumetaLibrary
-from .wrappers import *
-from .ast import *
+from .exceptions import (
+    CompilationError,
+    CorruptLibraryError,
+    IncompatibleLibraryError,
+    LegacyLibraryFormatError,
+    LibraryFormatError,
+    NumetaError,
+    NumetaNotImplementedError,
+    NumetaTypeError,
+    ToolchainNotFoundError,
+)
 from .settings import settings
+from ._version import __version__
+
+from . import ast as _ast
+from . import wrappers as _wrappers
+
+for _public_name in (*_ast.__all__, *_wrappers.__all__):
+    globals()[_public_name] = getattr(
+        _ast if _public_name in _ast.__all__ else _wrappers,
+        _public_name,
+    )
+
+__all__ = [
+    "Arg",
+    "ArrayType",
+    "CTranslationUnit",
+    "CompilationError",
+    "CorruptLibraryError",
+    "DataType",
+    "IncompatibleLibraryError",
+    "LegacyLibraryFormatError",
+    "LibraryFormatError",
+    "NumetaError",
+    "NumetaLibrary",
+    "NumetaNotImplementedError",
+    "NumetaTypeError",
+    "PointerType",
+    "StructType",
+    "ToolchainNotFoundError",
+    "Vector",
+    "VectorType",
+    "__version__",
+    "b1",
+    "bool8",
+    "c16",
+    "c32",
+    "c8",
+    "c_function_attributes",
+    "c_ptr",
+    "char",
+    "complex128",
+    "complex16",
+    "complex256",
+    "complex32",
+    "complex64",
+    "complex8",
+    "comptime",
+    "f16",
+    "f4",
+    "f8",
+    "float128",
+    "float32",
+    "float64",
+    "get_datatype",
+    "i4",
+    "i8",
+    "int32",
+    "int64",
+    "integer4",
+    "integer8",
+    "iso_c",
+    "jit",
+    "logical1",
+    "make_vector_type",
+    "omp",
+    "ptr",
+    "r16",
+    "r4",
+    "r8",
+    "real16",
+    "real4",
+    "real8",
+    "settings",
+    "size_t",
+    *_ast.__all__,
+    *_wrappers.__all__,
+]
+
+__all__ = list(dict.fromkeys(__all__))
+
+del _ast, _public_name, _wrappers
 
 settings.initialize_default_datatypes()

@@ -1,10 +1,6 @@
 import inspect
-import os
-import platform
-import sys
 import sysconfig
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -17,119 +13,18 @@ from .ast.expressions import ExpressionNode, GetAttr, GetItem
 from .types_hint import comptime
 
 
-def _compile_signature_extension(force=False):
-    """Compile the C signature extension if needed."""
-    import importlib.util
-
-    # Check if already compiled
-    spec = importlib.util.find_spec("numeta._signature")
-    if spec is not None and not force:
-        return True
-
-    # Check if source exists
-    c_file = Path(__file__).parent / "_signature.c"
-    if not c_file.exists():
-        return False
-
-    # Try to compile
-    try:
-        from .compiler import Compiler
-
-        module_dir = Path(__file__).parent
-
-        # Use standard compiler flags
-        std_flags = ["-O3", "-fPIC"]
-        cc = "/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else "gcc"
-        compiler = Compiler(cc, std_flags)
-
-        include_dirs = [
-            sysconfig.get_paths()["include"],
-            np.get_include(),
-        ]
-
-        additional_flags = ["-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION"]
-
-        # First compile to object file
-        obj_file, _ = compiler.compile_to_obj(
-            name="_signature",
-            directory=module_dir,
-            sources=[c_file],
-            include_dirs=include_dirs,
-            additional_flags=additional_flags,
-            obj_suffix=".o",
-        )
-
-        # Then link to shared library with correct Python extension name
-        libraries = [f"python{sys.version_info.major}.{sys.version_info.minor}"]
-        so_file = (
-            module_dir
-            / f"_signature.cpython-{sys.version_info.major}{sys.version_info.minor}-x86_64-linux-gnu.so"
-        )
-
-        # Use build_lib_command directly to control output filename
-        command = compiler.build_lib_command(
-            lib_file=so_file,
-            obj_files=[obj_file],
-            include_dirs=include_dirs,
-            additional_flags=additional_flags,
-            libraries=libraries,
-            libraries_dirs=[],
-            rpath_dirs=[],
-        )
-
-        compiler.run_command(command, cwd=module_dir)
-
-        return so_file.exists()
-    except Exception as e:
-        return False
-
-
-def _signature_extension_stale():
-    import importlib.util
-
-    c_file = Path(__file__).parent / "_signature.c"
-    so_file = None
-    try:
-        spec = importlib.util.find_spec("numeta._signature")
-    except ValueError:
-        spec = None
-
-    if spec is not None and spec.origin is not None:
-        so_file = Path(spec.origin)
-    else:
-        module = sys.modules.get("numeta._signature")
-        module_file = getattr(module, "__file__", None)
-        if module_file is not None:
-            so_file = Path(module_file)
-
-    if so_file is None:
-        return False
-    if not so_file.exists() or not c_file.exists():
-        return False
-    return c_file.stat().st_mtime > so_file.stat().st_mtime
-
-
 def _init_signature_module():
-    """Initialize the signature module, compiling if necessary."""
+    """Initialize the packaged signature accelerator when it is available."""
     import importlib
 
     try:
-        # Try importing first
         _signature = importlib.import_module("numeta._signature")
-        if _signature_extension_stale():
-            if not _compile_signature_extension(force=True):
-                return None, False
-            if "numeta._signature" in sys.modules:
-                del sys.modules["numeta._signature"]
-            _signature = importlib.import_module("numeta._signature")
     except ImportError:
-        # Try compiling and importing again
-        if not _compile_signature_extension():
-            return None, False
-        # Clear import cache and try again
-        if "numeta._signature" in sys.modules:
-            del sys.modules["numeta._signature"]
-        _signature = importlib.import_module("numeta._signature")
+        return None, False
+
+    required = ("BaseFunction", "fast_dispatch", "get_signature_and_runtime_args", "init_globals")
+    if not all(hasattr(_signature, name) for name in required):
+        return None, False
 
     types_dict = {
         "ArrayType": ArrayType,
@@ -855,8 +750,12 @@ int {func_name}(PyObject *args, PyObject **runtime_args, PyObject **sig, int *na
         np_include = np.get_include()
 
         # Initialize compiler (GCC)
-        cc = "/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else "gcc"
-        compiler = Compiler(cc, ["-O3"])
+        compiler = Compiler(
+            settings.c_compiler,
+            ["-O3"],
+            setting="set_c_compiler",
+            env_var="NUMETA_CC",
+        )
 
         # Compile to shared library
         compiler.compile_to_library(

@@ -3,19 +3,52 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import shlex
+import shutil
 import subprocess as sp
-import textwrap
 from typing import Iterable
 
-from .exceptions import CompilationError
+from .exceptions import CompilationError, ToolchainNotFoundError
 
 
 class Compiler:
-    def __init__(self, compiler, compile_flags: str | Iterable[str]) -> None:
-        if compiler == "gcc" and os.path.exists("/usr/bin/gcc"):
-            compiler = "/usr/bin/gcc"
-        self.compiler = compiler
+    def __init__(
+        self,
+        compiler,
+        compile_flags: str | Iterable[str],
+        *,
+        setting=None,
+        env_var=None,
+    ) -> None:
+        self.compiler = self._resolve_executable(
+            compiler,
+            setting=setting,
+            env_var=env_var,
+        )
         self.compile_flags = self._normalize_flags(compile_flags)
+
+    @staticmethod
+    def _resolve_executable(compiler, *, setting=None, env_var=None) -> str:
+        try:
+            compiler = os.fspath(compiler)
+        except TypeError as exc:
+            raise TypeError("compiler must be a path-like value") from exc
+        if not compiler:
+            raise ValueError("compiler cannot be empty")
+
+        if os.sep in compiler:
+            candidate = Path(compiler).expanduser().absolute()
+            resolved = (
+                str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+            )
+        else:
+            resolved = shutil.which(compiler)
+        if resolved is None:
+            raise ToolchainNotFoundError(
+                compiler,
+                setting=setting,
+                env_var=env_var,
+            )
+        return resolved
 
     @staticmethod
     def _normalize_flags(compile_flags: str | Iterable[str]) -> list[str]:
@@ -24,21 +57,37 @@ class Compiler:
         return list(compile_flags)
 
     def run_command(self, command: list[str], cwd: Path) -> sp.CompletedProcess[str]:
-        sp_run = sp.run(
-            command,
-            cwd=cwd,
-            stdout=sp.PIPE,
-            stderr=sp.PIPE,
-            text=True,
-        )
+        try:
+            sp_run = sp.run(
+                command,
+                cwd=cwd,
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            raise CompilationError(
+                command=command,
+                cwd=Path(cwd),
+                stderr=str(exc),
+            ) from exc
         if sp_run.returncode != 0:
-            error_message = "Error while compiling, the command was:\n"
-            error_message += " ".join(command) + "\n"
-            error_message += "The output was:\n"
-            error_message += textwrap.indent(sp_run.stdout, "    ")
-            error_message += textwrap.indent(sp_run.stderr, "    ")
-            raise CompilationError(error_message)
+            raise CompilationError(
+                command=command,
+                cwd=Path(cwd),
+                stdout=sp_run.stdout,
+                stderr=sp_run.stderr,
+            )
         return sp_run
+
+    def identity(self) -> dict:
+        """Return compiler provenance without applying user compile flags."""
+        result = self.run_command([self.compiler, "--version"], cwd=Path.cwd())
+        first_line = result.stdout.splitlines()[:1]
+        return {
+            "executable": self.compiler,
+            "version": first_line[0] if first_line else "unknown",
+        }
 
     def build_obj_command(
         self,

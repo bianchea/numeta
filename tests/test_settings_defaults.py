@@ -52,3 +52,23 @@ def test_compile_flags_parsing_uses_shlex():
         assert add_one.compile_flags == ["-O2", "-DTEST=hello world"]
     finally:
         _restore_settings(snapshot)
+
+
+def test_compiler_setting_precedes_environment(monkeypatch):
+    original_c = nm.settings._Settings__c_compiler
+    original_fortran = nm.settings._Settings__fortran_compiler
+    try:
+        nm.settings.set_c_compiler(None)
+        nm.settings.set_fortran_compiler(None)
+        monkeypatch.setenv("NUMETA_CC", "env-cc")
+        monkeypatch.setenv("NUMETA_FC", "env-fc")
+        assert nm.settings.c_compiler == "env-cc"
+        assert nm.settings.fortran_compiler == "env-fc"
+
+        nm.settings.set_c_compiler("explicit-cc")
+        nm.settings.set_fortran_compiler("explicit-fc")
+        assert nm.settings.c_compiler == "explicit-cc"
+        assert nm.settings.fortran_compiler == "explicit-fc"
+    finally:
+        nm.settings.set_c_compiler(original_c)
+        nm.settings.set_fortran_compiler(original_fortran)

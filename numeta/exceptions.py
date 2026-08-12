@@ -7,7 +7,64 @@ class NumetaError(Exception):
 class CompilationError(NumetaError):
     """Error during compilation."""
 
-    pass
+    def __init__(
+        self,
+        message=None,
+        *,
+        command=None,
+        cwd=None,
+        stdout="",
+        stderr="",
+    ):
+        self.command = tuple(command or ())
+        self.cwd = cwd
+        self.stdout = stdout
+        self.stderr = stderr
+
+        if message is None:
+            import shlex
+
+            rendered_command = shlex.join(self.command)
+            message = f"Error while compiling in {cwd}:\n  {rendered_command}"
+            if stdout:
+                message += f"\nCompiler stdout:\n{stdout.rstrip()}"
+            if stderr:
+                message += f"\nCompiler stderr:\n{stderr.rstrip()}"
+        super().__init__(message)
+
+
+class ToolchainNotFoundError(NumetaError):
+    """A configured native compiler cannot be found or executed."""
+
+    def __init__(self, compiler, *, setting=None, env_var=None):
+        self.compiler = compiler
+        self.setting = setting
+        self.env_var = env_var
+        guidance = []
+        if setting:
+            guidance.append(f"settings.{setting}(...)")
+        if env_var:
+            guidance.append(env_var)
+        suffix = f" Configure it with {' or '.join(guidance)}." if guidance else ""
+        super().__init__(
+            f"Native compiler {compiler!r} was not found or is not executable.{suffix}"
+        )
+
+
+class LibraryFormatError(NumetaError):
+    """Base error for persisted Numeta library bundles."""
+
+
+class CorruptLibraryError(LibraryFormatError):
+    """A persisted library bundle is incomplete or has invalid checksums."""
+
+
+class IncompatibleLibraryError(LibraryFormatError):
+    """A native library bundle is incompatible with the current runtime."""
+
+
+class LegacyLibraryFormatError(LibraryFormatError):
+    """A legacy pickle-based Numeta library was found."""
 
 
 class NumetaTypeError(NumetaError):

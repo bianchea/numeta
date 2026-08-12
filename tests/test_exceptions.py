@@ -81,6 +81,24 @@ def test_compiler_run_command_raises_compilation_error(monkeypatch, tmp_path):
     assert "gcc -v" in message
     assert "stdout output" in message
     assert "stderr output" in message
+    assert exc_info.value.command == ("gcc", "-v")
+    assert exc_info.value.cwd == tmp_path
+    assert exc_info.value.stdout == "stdout output\n"
+    assert exc_info.value.stderr == "stderr output\n"
+
+
+def test_compiler_reports_missing_toolchain():
+    from numeta.exceptions import ToolchainNotFoundError
+
+    with pytest.raises(ToolchainNotFoundError, match="NUMETA_CC") as exc_info:
+        Compiler(
+            "numeta-compiler-that-does-not-exist",
+            "",
+            setting="set_c_compiler",
+            env_var="NUMETA_CC",
+        )
+
+    assert exc_info.value.compiler == "numeta-compiler-that-does-not-exist"
 
 
 def test_cond_helper_wraps_generated_source_with_except_exception():

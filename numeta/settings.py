@@ -1,3 +1,4 @@
+import os
 import shlex
 
 
@@ -177,6 +178,8 @@ class Settings:
         c_temporary_allocation="heap",
         c_stack_temporary_max_bytes=32768,
         c_allow_vla_temporaries=False,
+        c_compiler=None,
+        fortran_compiler=None,
     ):
         """Initialize the settings.
         Parameters
@@ -240,6 +243,10 @@ class Settings:
         self.c_temporary_allocation = c_temporary_allocation
         self.c_stack_temporary_max_bytes = c_stack_temporary_max_bytes
         self.c_allow_vla_temporaries = c_allow_vla_temporaries
+        self.__c_compiler = None
+        self.__fortran_compiler = None
+        self.set_c_compiler(c_compiler)
+        self.set_fortran_compiler(fortran_compiler)
 
     @staticmethod
     def _normalize_compile_flags(compile_flags):
@@ -360,6 +367,34 @@ class Settings:
             raise TypeError("compile_flags cannot be None")
         normalized = self._normalize_compile_flags(compile_flags)
         self.__default_compile_flags = normalized
+
+    @staticmethod
+    def _validate_compiler(value, name):
+        if value is None:
+            return None
+        try:
+            value = os.fspath(value)
+        except TypeError as exc:
+            raise TypeError(f"{name} must be a path-like value or None") from exc
+        if not value:
+            raise ValueError(f"{name} cannot be empty")
+        return value
+
+    @property
+    def c_compiler(self):
+        return self.__c_compiler or os.environ.get("NUMETA_CC") or "gcc"
+
+    def set_c_compiler(self, compiler):
+        """Set the C compiler executable; ``None`` restores environment discovery."""
+        self.__c_compiler = self._validate_compiler(compiler, "c_compiler")
+
+    @property
+    def fortran_compiler(self):
+        return self.__fortran_compiler or os.environ.get("NUMETA_FC") or "gfortran"
+
+    def set_fortran_compiler(self, compiler):
+        """Set the Fortran compiler executable; ``None`` restores environment discovery."""
+        self.__fortran_compiler = self._validate_compiler(compiler, "fortran_compiler")
 
     @property
     def default_simd_arch(self):

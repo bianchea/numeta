@@ -191,7 +191,12 @@ class NumetaCompiledFunction(ExternalLibrary):
         if self._obj_files is None:
             obj_name = self.func_name
             if self.backend == "fortran":
-                compiler = Compiler("gfortran", self.compile_flags)
+                compiler = Compiler(
+                    settings.fortran_compiler,
+                    self.compile_flags,
+                    setting="set_fortran_compiler",
+                    env_var="NUMETA_FC",
+                )
                 fortran_src = self._path / f"{obj_name}_src.f90"
                 from .ir import FortranEmitter, lower_procedure
                 from .ast.namespace import Namespace
@@ -216,7 +221,12 @@ class NumetaCompiledFunction(ExternalLibrary):
                 from .ir import lower_procedure
                 from .ast.namespace import Namespace
 
-                compiler = Compiler("gcc", self.compile_flags)
+                compiler = Compiler(
+                    settings.c_compiler,
+                    self.compile_flags,
+                    setting="set_c_compiler",
+                    env_var="NUMETA_CC",
+                )
                 c_src = self._path / f"{obj_name}_src.c"
                 emitter = CEmitter(simd_arch=self.simd_arch, simd_features=self.simd_features)
                 if isinstance(self.symbolic_function, Namespace):
@@ -310,7 +320,12 @@ class NumetaCompiledFunction(ExternalLibrary):
                     else:
                         additional_flags.extend(list(lib.additional_flags))
 
-            compiler = Compiler("gcc", self.compile_flags)
+            compiler = Compiler(
+                settings.c_compiler,
+                self.compile_flags,
+                setting="set_c_compiler",
+                env_var="NUMETA_CC",
+            )
             lib = compiler.compile_to_library(
                 self.library_name,
                 self.obj_files,

@@ -13,7 +13,6 @@ from pathlib import Path
 from .settings import settings
 from .compiler import Compiler
 
-
 WRAPPER_CACHE_FORMAT_VERSION = 1
 NUMETA_WRAPPER_ABI_VERSION = 1
 
@@ -63,7 +62,15 @@ class PyCExtension:
             compile_flags, backend=backend
         )
 
-    def compile(self, core_lib_name, core_lib_path, directory, compile_flags, backend=None):
+    def compile(
+        self,
+        core_lib_name,
+        core_lib_path,
+        directory,
+        compile_flags,
+        backend=None,
+        runtime_rpath=None,
+    ):
         if self.lib_path is not None:
             return self.lib_path
 
@@ -92,15 +99,20 @@ class PyCExtension:
         include_dirs = [sysconfig.get_paths()["include"], np.get_include()]
         additional_flags = ["-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION"]
 
-        compiler = Compiler("gcc", compile_flags)
+        compiler = Compiler(
+            settings.c_compiler,
+            compile_flags,
+            setting="set_c_compiler",
+            env_var="NUMETA_CC",
+        )
         lib = compiler.compile_to_library(
             self.name,
             [wrapper_src],
             directory=directory,
             include_dirs=include_dirs,
             libraries=libraries,
-            libraries_dirs=[],
-            rpath_dirs=[core_lib_path],
+            libraries_dirs=[core_lib_path],
+            rpath_dirs=[core_lib_path if runtime_rpath is None else runtime_rpath],
             additional_flags=additional_flags,
         )
         self.set_lib_path(lib)

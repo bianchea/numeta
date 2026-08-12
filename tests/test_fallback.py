@@ -1,6 +1,8 @@
 import sys
 import subprocess
 import os
+import shutil
+from pathlib import Path
 import pytest
 
 
@@ -68,3 +70,32 @@ print("SUCCESS")
 
     if "SUCCESS" not in result.stdout:
         pytest.fail(f"Fallback script did not report success:\nSTDOUT: {result.stdout}")
+
+
+def test_import_without_signature_extension_does_not_compile(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "numeta"
+    package = tmp_path / "numeta"
+    shutil.copytree(
+        source,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.so", "*.o"),
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, numeta; "
+            "p = pathlib.Path(numeta.__file__).parent; "
+            "assert not list(p.glob('*.so')); assert not list(p.glob('*.o'))",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

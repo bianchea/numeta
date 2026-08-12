@@ -1,24 +1,69 @@
-image: python:3.12
-
 stages:
+  - quality
   - test
+  - package
   - deploy
 
-test:
+.native-test:
   stage: test
+  image: python:${PYTHON_VERSION}
   before_script:
     - apt-get update
-    - apt-get install -y gfortran liblapack-dev libblas-dev build-essential
-    - pip install numpy pytest
-    - pip install .
+    - apt-get install -y --no-install-recommends build-essential gfortran liblapack-dev libblas-dev
+    - python -m pip install --upgrade pip
+    - python -m pip install ".[dev]"
+
+format:
+  stage: quality
+  image: python:3.12
+  before_script:
+    - python -m pip install black==24.4.2
   script:
-    - pytest -v
+    - black --check numeta tests setup.py
+
+test-c:
+  extends: .native-test
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.12", "3.13", "3.14"]
+  script:
+    - pytest -v --backend=c
+
+test-fortran:
+  extends: .native-test
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.12", "3.13", "3.14"]
+  script:
+    - pytest -v --backend=fortran
+
+package:
+  stage: package
+  image: python:3.12
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends build-essential
+    - python -m pip install --upgrade pip
+    - python -m pip install build twine
+  script:
+    - python -m build
+    - twine check dist/*
+    - python -m venv /tmp/numeta-wheel-test
+    - /tmp/numeta-wheel-test/bin/pip install dist/*.whl
+    - cd /tmp
+    - /tmp/numeta-wheel-test/bin/python -c "import numeta, numeta._signature; print(numeta.__version__)"
+  artifacts:
+    paths:
+      - dist/
 
 deploy_pypi:
   stage: deploy
+  image: python:3.12
+  dependencies:
+    - package
+  before_script:
+    - python -m pip install twine
   script:
-    - pip install build twine
-    - python -m build
     - twine upload --verbose --non-interactive --username __token__ --password "$PYPI_API_TOKEN" dist/*
   only:
     - tags

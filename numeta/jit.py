@@ -1,4 +1,8 @@
 import warnings
+import hashlib
+import marshal
+import os
+from pathlib import Path
 
 from typing import (
     Any,
@@ -36,6 +40,9 @@ def jit(
     c_attributes: Iterable[str] | str | None = None,
     c_linkage: str | None = None,
     emit_mode: str | None = None,
+    cache: bool = False,
+    debug: bool = False,
+    allow_new_specializations: bool = True,
 ):
     """@jit(...) used with arguments."""
     ...
@@ -58,6 +65,9 @@ def jit(
     c_attributes: Iterable[str] | str | None = None,
     c_linkage: str | None = None,
     emit_mode: str | None = None,
+    cache: bool = False,
+    debug: bool = False,
+    allow_new_specializations: bool = True,
 ):
     """
     Compile a function with the Numeta JIT, either directly or via parameters.
@@ -95,6 +105,8 @@ def jit(
     -------
     NumetaFunction
     """
+    if cache and directory is not None:
+        raise ValueError("jit() cannot specify both cache=True and directory")
     if backend is None:
         backend = settings.default_backend
     if do_checks is None:
@@ -114,6 +126,19 @@ def jit(
         c_attributes_tuple = tuple(c_attributes or ())
     compile_flags = settings._normalize_compile_flags(compile_flags)
     compile_flags_list = list(compile_flags)
+    if debug:
+        compile_flags_list = [flag for flag in compile_flags_list if not flag.startswith("-O")]
+        compile_flags_list.extend(["-O0", "-g"])
+        if backend == "fortran":
+            compile_flags_list.extend(["-fcheck=bounds", "-fbacktrace"])
+
+    def resolved_directory(f):
+        if not cache:
+            return directory
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        digest = hashlib.sha256(marshal.dumps(f.__code__)).hexdigest()[:24]
+        return cache_root / "numeta" / "v1" / f"{f.__name__}-{digest}"
+
     if func is None:
 
         def decorator_wrapper(f) -> NumetaFunction:
@@ -150,7 +175,7 @@ def jit(
             else:
                 nm_func = NumetaFunction(
                     f,
-                    directory=directory,
+                    directory=resolved_directory(f),
                     do_checks=do_checks,
                     compile_flags=compile_flags_list,
                     namer=namer,
@@ -162,6 +187,7 @@ def jit(
                     c_attributes=c_attributes_tuple,
                     c_linkage=c_linkage,
                     emit_mode=emit_mode,
+                    allow_new_specializations=allow_new_specializations,
                 )
                 if library is not None:
                     library.register(nm_func)
@@ -171,7 +197,7 @@ def jit(
     else:
         nm_func = NumetaFunction(
             func,
-            directory=directory,
+            directory=resolved_directory(func),
             do_checks=do_checks,
             compile_flags=compile_flags_list,
             namer=namer,
@@ -183,6 +209,7 @@ def jit(
             c_attributes=c_attributes_tuple,
             c_linkage=c_linkage,
             emit_mode=emit_mode,
+            allow_new_specializations=allow_new_specializations,
         )
         return nm_func
 

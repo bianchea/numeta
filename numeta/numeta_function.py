@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import warnings
+from types import MappingProxyType
 from contextlib import contextmanager
 from threading import Lock, RLock, local
 from typing import Iterable
@@ -560,6 +561,29 @@ class NumetaFunction(BaseFunction):
             NumetaSpecialization(self, signature) for signature in self._compiled_functions
         )
 
+    @property
+    def sources(self):
+        """Read-only generated source mapping keyed by stable signature ID."""
+        from .library_signature import signature_id
+
+        return MappingProxyType(
+            {
+                signature_id(signature): compiled.render_source()
+                for signature, compiled in self._compiled_functions.items()
+            }
+        )
+
+    @property
+    def source(self):
+        """Generated source for the most recently selected specialization."""
+        signature = getattr(self, "_last_signature", None)
+        if signature is None or signature not in self._compiled_functions:
+            raise RuntimeError(
+                f"Function {self.name!r} has no selected specialization. Call it or use "
+                "specialize(...) before accessing .source."
+            )
+        return self._compiled_functions[signature].render_source()
+
     def __init__(
         self,
         func,
@@ -575,6 +599,7 @@ class NumetaFunction(BaseFunction):
         c_attributes: Iterable[str] | str | None = None,
         c_linkage: str | None = None,
         emit_mode: str | None = None,
+        allow_new_specializations: bool = True,
     ) -> None:
         ExternalLibrary.__init__(self, func.__name__, to_link=True)
         self.name = func.__name__
@@ -605,6 +630,8 @@ class NumetaFunction(BaseFunction):
         self.c_attributes = decorated_attributes + tuple(c_attributes or ())
         self.c_linkage = c_linkage
         self.emit_mode = emit_mode
+        self.allow_new_specializations = bool(allow_new_specializations)
+        self._last_signature = None
 
         self.namer = namer
         self.inline = inline
@@ -757,6 +784,7 @@ class NumetaFunction(BaseFunction):
                     "library=library, reattach=True) first."
                 )
             self.construct_compiled_target(signature)
+        self._last_signature = signature
 
         from .specialization import NumetaSpecialization
 
@@ -795,6 +823,13 @@ class NumetaFunction(BaseFunction):
 
     def _handle_cache_miss(self, signature, runtime_args):
         """Called by C dispatch on cache miss."""
+        if signature not in self._compiled_functions and not getattr(
+            self, "allow_new_specializations", True
+        ):
+            raise RuntimeError(
+                f"Function {self.name!r} does not allow new specializations. Register this "
+                "signature first with specialize(...)."
+            )
         if self._func is None and signature not in self._compiled_functions:
             raise RuntimeError(
                 f"Function {self.name!r} was loaded without its Python body and cannot "
@@ -805,6 +840,7 @@ class NumetaFunction(BaseFunction):
         with _directory_build_lock(self.directory):
             if signature not in self._compiled_functions:
                 self.construct_compiled_target(signature)
+            self._last_signature = signature
             self.load(signature)
             return self._fast_call[signature](*runtime_args)
 
@@ -812,7 +848,13 @@ class NumetaFunction(BaseFunction):
         """Called by C dispatch when symbolic execution is required."""
         builder = BuilderHelper.current_builder
         if signature not in self._compiled_functions:
+            if not getattr(self, "allow_new_specializations", True):
+                raise RuntimeError(
+                    f"Function {self.name!r} does not allow new specializations. Register "
+                    "this signature first with specialize(...)."
+                )
             self.construct_compiled_target(signature)
+        self._last_signature = signature
         symbolic_fun = self._compiled_functions[signature].symbolic_function
 
         # Code-generation-only path: materialize symbolic IR but do not compile.

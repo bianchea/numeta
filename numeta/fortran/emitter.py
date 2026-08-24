@@ -40,7 +40,6 @@ from numeta.ir.nodes import (
     IROpaqueStmt,
 )
 
-
 _FORTRAN_BINARY_OPS = {
     "eq": ".eq.",
     "ne": ".ne.",
@@ -209,6 +208,12 @@ class FortranEmitter:
     def _is_integer_expr(self, expr: IRExpr) -> bool:
         if isinstance(expr, IRLiteral) and isinstance(expr.value, int):
             return True
+        if isinstance(expr, IRGetItem) and expr.base is not None:
+            return self._is_integer_expr(expr.base)
+        source_dtype = getattr(getattr(expr, "source", None), "dtype", None)
+        source_name = getattr(source_dtype, "_name", "")
+        if source_name == "size_t" or source_name.startswith(("int", "uint")):
+            return True
         if expr.vtype and expr.vtype.dtype.name == "integer":
             return True
         if (
@@ -239,8 +244,42 @@ class FortranEmitter:
                 return [var.name]
             return ["<var>"]
         if expr_type is IRBinary:
+            left = self._expr_blocks(expr.left)
+            right = self._expr_blocks(expr.right)
+            if expr.op == "shl":
+                return ["ishft(", *left, ",", *right, ")"]
+            if expr.op == "shr":
+                return ["ishft(", *left, ",-(", *right, "))"]
+            if expr.op in {"xor", "bitand", "bitor"}:
+                intrinsic = {"xor": "ieor", "bitand": "iand", "bitor": "ior"}[expr.op]
+                return [intrinsic, "(", *left, ",", *right, ")"]
+            if expr.op in {"mod", "truncmod"}:
+                intrinsic = "modulo" if expr.op == "mod" else "mod"
+                return [intrinsic, "(", *left, ",", *right, ")"]
+            if expr.op in {"floordiv", "truncdiv"}:
+                if expr.op == "truncdiv":
+                    return ["(", *left, "/", *right, ")"]
+                if self._is_integer_expr(expr) or (
+                    self._is_integer_expr(expr.left) and self._is_integer_expr(expr.right)
+                ):
+                    return [
+                        "((",
+                        *left,
+                        "/",
+                        *right,
+                        ")-merge(1,0,mod(",
+                        *left,
+                        ",",
+                        *right,
+                        ")/=0.and.((",
+                        *left,
+                        "<0).neqv.(",
+                        *right,
+                        "<0))))",
+                    ]
+                return ["real(floor(", *left, "/", *right, "),kind=kind(", *left, "))"]
             op = _FORTRAN_BINARY_OPS.get(expr.op, expr.op)
-            return ["(", *self._expr_blocks(expr.left), op, *self._expr_blocks(expr.right), ")"]
+            return ["(", *left, op, *right, ")"]
         if expr_type is IRUnary:
             if expr.op == "neg":
                 return ["-", "(", *self._expr_blocks(expr.operand), ")"]
@@ -315,6 +354,93 @@ class FortranEmitter:
 
             # Map intrinsic name if necessary
             name = _FORTRAN_INTRINSIC_MAP.get(expr.name, expr.name)
+
+            if expr.name == "copysign":
+                return [
+                    "sign(abs(",
+                    *self._expr_blocks(expr.args[0]),
+                    "),",
+                    *self._expr_blocks(expr.args[1]),
+                    ")",
+                ]
+
+            if expr.name == "round_even":
+                value = self._expr_blocks(expr.args[0])
+                scale = (
+                    ["1.0"]
+                    if len(expr.args) == 1
+                    else ["(10.0**", *self._expr_blocks(expr.args[1]), ")"]
+                )
+                scaled = ["(", *value, "*", *scale, ")"]
+                rounded = [
+                    "merge(floor(",
+                    *scaled,
+                    "),ceiling(",
+                    *scaled,
+                    "),(",
+                    *scaled,
+                    "-floor(",
+                    *scaled,
+                    ")<0.5).or.(",
+                    *scaled,
+                    "-floor(",
+                    *scaled,
+                    ")==0.5.and.modulo(floor(",
+                    *scaled,
+                    "),2)==0))",
+                ]
+                if len(expr.args) == 1:
+                    return ["int(", *rounded, ")"]
+                return ["real(", *rounded, ",kind=kind(", *value, "))/", *scale]
+
+            if expr.name == "astype":
+                dtype = expr.vtype.dtype
+                intrinsic = {
+                    "integer": "int",
+                    "real": "real",
+                    "complex": "cmplx",
+                    "logical": "logical",
+                }.get(dtype.name)
+                if intrinsic is None:
+                    raise NotImplementedError(f"Cannot cast to Fortran type {dtype.name!r}")
+                kind = dtype.kind
+                blocks = [intrinsic, "(", *self._expr_blocks(expr.args[0])]
+                if kind is not None:
+                    blocks.extend([",kind=", str(kind)])
+                blocks.append(")")
+                return blocks
+
+            if expr.name == "select":
+                return [
+                    "merge(",
+                    *self._expr_blocks(expr.args[1]),
+                    ",",
+                    *self._expr_blocks(expr.args[2]),
+                    ",",
+                    *self._expr_blocks(expr.args[0]),
+                    ")",
+                ]
+
+            if expr.name == "matmul":
+                # Numeta's public dimensions are C/Python ordered while the
+                # Fortran view reverses those dimensions. Reversing the native
+                # operands preserves the public ``matmul(a, b)`` contract.
+                left, right = expr.args
+                left_shape = left.vtype.shape if left.vtype is not None else None
+                right_shape = right.vtype.shape if right.vtype is not None else None
+                native_args = (
+                    (left, right)
+                    if getattr(left_shape, "order", None) == "F"
+                    and getattr(right_shape, "order", None) == "F"
+                    else (right, left)
+                )
+                return [
+                    "matmul(",
+                    *self._expr_blocks(native_args[0]),
+                    ",",
+                    *self._expr_blocks(native_args[1]),
+                    ")",
+                ]
 
             # Workaround for LOG10(complex) which is not standard in Fortran
             if name == "log10" and expr.args:

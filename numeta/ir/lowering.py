@@ -11,6 +11,7 @@ from numeta.ast.expressions import (
     FunctionCall,
     GetAttr,
     GetItem,
+    WholeStorage,
     IntrinsicFunction,
     LiteralNode,
 )
@@ -79,6 +80,13 @@ _BINARY_OPS: dict[str, str] = {
     "*": "mul",
     "/": "div",
     "**": "pow",
+    "//": "floordiv",
+    "%": "mod",
+    "<<": "shl",
+    ">>": "shr",
+    "^": "xor",
+    "bitand": "bitand",
+    "bitor": "bitor",
 }
 
 
@@ -134,6 +142,7 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
     binary_type = BinaryOperationNode
     function_call_type = FunctionCall
     getitem_type = GetItem
+    whole_storage_type = WholeStorage
     getattr_type = GetAttr
     array_constructor_type = ArrayConstructor
     intrinsic_type = IntrinsicFunction
@@ -256,6 +265,8 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                 vtype=ir_var.vtype,
                 source=expr,
             )
+        if expr_type is whole_storage_type:
+            return lower_expr(expr.variable)
         if expr_type is binary_type or isinstance(expr, binary_type):
             op = _map_binary_op(expr.op)
             return IRBinary(
@@ -515,6 +526,8 @@ def _lower_index_value(value, syntax_settings) -> IRExpr | None:
         return IRLiteral(value=value.value)
     if value_type is Variable:
         return IRVarRef(var=IRVar(name=value.name, source=value), source=value)
+    if value_type is WholeStorage:
+        return _lower_index_value(value.variable, syntax_settings)
     if value_type is BinaryOperationNode or isinstance(value, BinaryOperationNode):
         op = _map_binary_op(value.op)
         left = _lower_index_value(value.left, syntax_settings) or IROpaqueExpr(

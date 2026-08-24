@@ -67,6 +67,11 @@ _C_BINARY_OPS = {
     "mul": "*",
     "div": "/",
     "pow": "**",
+    "shl": "<<",
+    "shr": ">>",
+    "xor": "^",
+    "bitand": "&",
+    "bitor": "|",
 }
 
 
@@ -2172,9 +2177,6 @@ class CEmitter:
                 origin=expr,
             )
 
-        if not (left_info["fortran_order"] or right_info["fortran_order"]):
-            left_info, right_info = right_info, left_info
-
         pre_lines.append(
             f"{'    ' * (indent + 2)}for (npy_intp {k_var} = 0; {k_var} < {left_info['dims_exprs'][1]}; {k_var}++) {{\n"
         )
@@ -2485,9 +2487,6 @@ class CEmitter:
                 origin=expr,
             )
 
-        if not (left_info["fortran_order"] or right_info["fortran_order"]):
-            left_info, right_info = right_info, left_info
-
         i_var = "_nm_i_m"
         j_var = "_nm_j_m"
         k_var = "_nm_k_m"
@@ -2599,6 +2598,10 @@ class CEmitter:
         if isinstance(expr, IRBinary):
             if self._is_vector_expr(expr):
                 return self._render_vector_binary(expr)
+            if expr.op in {"floordiv", "mod", "truncdiv", "truncmod"}:
+                return self._render_divmod(
+                    expr, lambda value: self._render_expr_with_slice(value, loop_vars)
+                )
             op = _C_BINARY_OPS.get(expr.op, expr.op)
             if op == "**":
                 return self._render_power(
@@ -2685,6 +2688,31 @@ class CEmitter:
         right = self._render_vector_operand(expr.right, vector_dtype)
         return f"{helper}({left}, {right})"
 
+    def _render_divmod(self, expr: IRBinary, render) -> str:
+        left = render(expr.left)
+        right = render(expr.right)
+        integer_operands = self._is_integer_expr(expr) or (
+            self._is_integer_expr(expr.left) and self._is_integer_expr(expr.right)
+        )
+        if expr.op == "truncdiv":
+            return f"(({left}) / ({right}))"
+        if expr.op == "truncmod":
+            if integer_operands:
+                return f"(({left}) % ({right}))"
+            self._requires_math = True
+            return f"fmod(({left}), ({right}))"
+        if integer_operands:
+            quotient = f"(({left}) / ({right}))"
+            correction = f"(((({left}) % ({right})) != 0) && ((({left}) < 0) != (({right}) < 0)))"
+            floor_quotient = f"({quotient} - {correction})"
+            if expr.op == "floordiv":
+                return floor_quotient
+            return f"(({left}) - ({floor_quotient}) * ({right}))"
+        self._requires_math = True
+        if expr.op == "floordiv":
+            return f"floor(({left}) / ({right}))"
+        return f"fmod(fmod(({left}), ({right})) + ({right}), ({right}))"
+
     def _render_vector_operand(self, expr: IRExpr | None, vector_dtype) -> str:
         rendered = self._render_expr(expr)
         if self._is_vector_expr(expr):
@@ -2750,6 +2778,8 @@ class CEmitter:
         if isinstance(expr, IRBinary):
             if self._is_vector_expr(expr):
                 return self._render_vector_binary(expr)
+            if expr.op in {"floordiv", "mod", "truncdiv", "truncmod"}:
+                return self._render_divmod(expr, self._render_expr)
             op = _C_BINARY_OPS.get(expr.op, expr.op)
             if op == "**":
                 return self._render_power(expr.left, expr.right, self._render_expr)
@@ -3084,14 +3114,20 @@ class CEmitter:
     def _is_integer_expr(self, expr: IRExpr) -> bool:
         if isinstance(expr, IRLiteral) and isinstance(expr.value, int):
             return True
-        if expr.vtype and expr.vtype.dtype.name in {"integer", "size_t"}:
+        if isinstance(expr, IRGetItem) and expr.base is not None:
+            return self._is_integer_expr(expr.base)
+        source_dtype = getattr(getattr(expr, "source", None), "dtype", None)
+        source_name = getattr(source_dtype, "_name", "")
+        if source_name == "size_t" or source_name.startswith(("int", "uint")):
             return True
-        if (
-            isinstance(expr, IRVarRef)
-            and expr.var
-            and self._dtype_from_irvar(expr.var)
-            and self._dtype_from_irvar(expr.var).name in {"integer", "size_t"}
+        ir_name = getattr(getattr(getattr(expr, "vtype", None), "dtype", None), "name", None)
+        if isinstance(ir_name, str) and (
+            ir_name in {"integer", "size_t"} or ir_name.startswith(("int", "uint"))
         ):
+            return True
+        dtype = self._dtype_from_expr(expr)
+        numpy_dtype = getattr(dtype, "get_numpy", lambda: None)()
+        if numpy_dtype is not None and np.issubdtype(numpy_dtype, np.integer):
             return True
         return False
 
@@ -3184,6 +3220,26 @@ class CEmitter:
             return f"{helper}({args[0]})"
         if name == "array_constructor":
             return f"(npy_intp[]){{{', '.join(args)}}}"
+        if name == "round_even":
+            self._requires_math = True
+            if len(args) == 1:
+                return f"((npy_int64)nearbyint({args[0]}))"
+            scale = f"pow(10.0, {args[1]})"
+            return f"(nearbyint(({args[0]}) * {scale}) / {scale})"
+        if name == "astype":
+            dtype = self._dtype_from_expr(expr)
+            ctype = dtype.get_cnumpy()
+            return f"(({ctype})({args[0]}))"
+        if name == "select":
+            return f"(({args[0]}) ? ({args[1]}) : ({args[2]}))"
+        if name == "cmplx":
+            dtype = self._dtype_from_expr(expr)
+            constructor = {
+                "complex64": "CMPLXF",
+                "complex128": "CMPLX",
+                "complex256": "CMPLXL",
+            }.get(getattr(dtype, "_name", ""), "CMPLX")
+            return f"{constructor}({args[0]}, {args[1]})"
         if name == "shape":
             if not expr.args:
                 raise NotImplementedError("Cannot lower shape() in C without target expression.")

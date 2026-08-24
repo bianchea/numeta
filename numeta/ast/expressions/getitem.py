@@ -76,6 +76,13 @@ class GetItem(ExpressionNode):
 
         Assignment(self[key], value)
 
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        from .getattr import GetAttr
+
+        return GetAttr(self, name)
+
     def get_with_updated_variables(self, variables_couples):
 
         from numeta.ast.tools import update_variables

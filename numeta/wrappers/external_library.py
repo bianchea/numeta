@@ -136,6 +136,7 @@ def external_function(
     c_attributes: Sequence[str] | str | None = None,
     c_linkage: str | None = None,
     emit_mode: str | None = None,
+    pure: bool = False,
 ):
     lib = ExternalLibraryWrapper(f"{name}_external", to_link=False)
     lib.add_method(name, args, returns, bind_c=bind_c)
@@ -145,4 +146,5 @@ def external_function(
     proc.c_attributes = tuple(c_attributes or ())
     proc.c_linkage = c_linkage
     proc.emit_mode = emit_mode
+    proc.pure = bool(pure)
     return proc

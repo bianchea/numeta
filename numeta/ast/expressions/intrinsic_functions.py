@@ -200,22 +200,27 @@ class Conjugate(UnaryIntrinsicFunction):
 class Complex(IntrinsicFunction):
     token = "cmplx"
 
-    def __init__(self, real, imaginary, kind=None):
+    def __init__(self, real, imaginary, kind=None, dtype=None):
         from numeta.settings import settings
 
+        self._dtype = dtype or settings.syntax.DEFAULT_COMPLEX
         if kind is None:
-            kind = settings.syntax.DEFAULT_COMPLEX.get_fortran().kind
+            kind = self._dtype.get_fortran().kind
         super().__init__(real, imaginary, kind)
 
     @property
     def dtype(self):
-        from numeta.settings import settings
-
-        return settings.syntax.DEFAULT_COMPLEX
+        return self._dtype
 
     @property
     def _shape(self):
         return self.arguments[0]._shape
+
+    def get_with_updated_variables(self, variables_couples):
+        real, imaginary, _kind = [
+            arg.get_with_updated_variables(variables_couples) for arg in self.arguments
+        ]
+        return type(self)(real, imaginary, dtype=self._dtype)
 
 
 class Transpose(UnaryIntrinsicFunction):
@@ -291,6 +296,65 @@ class Floor(UnaryMathIntrinsic):
 
 class Ceil(UnaryMathIntrinsic):
     token = "ceil"
+
+
+class Round(IntrinsicFunction):
+    token = "round_even"
+
+    def __init__(self, argument, ndigits=None):
+        if ndigits is not None and not isinstance(ndigits, int):
+            raise_with_source(
+                TypeError,
+                "round(x, ndigits) requires ndigits to be a compile-time-known integer.",
+                source_node=argument,
+            )
+        self.ndigits = ndigits
+        super().__init__(argument, *(() if ndigits is None else (ndigits,)))
+
+    @property
+    def dtype(self):
+        if self.ndigits is not None:
+            return self.arguments[0].dtype
+        from numeta.settings import settings
+
+        return settings.syntax.DEFAULT_INTEGER
+
+
+class Cast(UnaryIntrinsicFunction):
+    token = "astype"
+
+    def __init__(self, argument, dtype):
+        from numeta.datatype import get_datatype
+
+        self._dtype = get_datatype(dtype)
+        super().__init__(argument)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def get_with_updated_variables(self, variables_couples):
+        return type(self)(
+            self.arguments[0].get_with_updated_variables(variables_couples), self._dtype
+        )
+
+
+class Select(IntrinsicFunction):
+    token = "select"
+
+    def __init__(self, condition, when_true, when_false):
+        super().__init__(condition, when_true, when_false)
+
+    @property
+    def dtype(self):
+        return self.arguments[1].dtype
+
+    @property
+    def _shape(self):
+        for argument in self.arguments:
+            if not argument._shape.is_scalar:
+                return argument._shape
+        return SCALAR
 
 
 class Sin(UnaryMathIntrinsic):
@@ -516,6 +580,8 @@ class Matmul(BinaryIntrinsicFunction):
     def _shape(self):
         a_shape = self.arguments[0]._shape
         b_shape = self.arguments[1]._shape
+        if a_shape.rank == 1 and b_shape.rank == 1:
+            return SCALAR
         if a_shape.rank == 1:
             return ArrayShape((b_shape.dim(1),))
         if b_shape.rank == 1:
@@ -542,6 +608,7 @@ log10 = Log10
 sqrt = Sqrt
 floor = Floor
 ceil = Ceil
+round = Round
 sin = Sin
 cos = Cos
 tan = Tan

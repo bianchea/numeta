@@ -35,6 +35,7 @@ from .simd import (
     where,
 )
 from .time import time
+from .divmod import trunc_div, trunc_mod
 
 __all__ = [
     "Arg",
@@ -65,6 +66,8 @@ __all__ = [
     "scalar",
     "simd_lanes",
     "time",
+    "trunc_div",
+    "trunc_mod",
     "unpack_high",
     "unpack_low",
     "vector",

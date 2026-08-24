@@ -10,7 +10,7 @@ from .array_shape import ArrayShape, SCALAR, UNKNOWN
 from .datatype import DataType, DataTypeMeta, ArrayType, PointerType, get_datatype
 from .settings import settings
 from .ast import Variable
-from .ast.expressions import ExpressionNode, GetAttr, GetItem
+from .ast.expressions import ExpressionNode, GetAttr, GetItem, WholeStorage
 from .types_hint import comptime
 
 SIGNATURE_IDENTITY_VERSION = 1
@@ -203,7 +203,7 @@ def _use_c_signature_parser_backend():
 
 def _resolve_effective_intent(arg):
     target = arg
-    while isinstance(target, (GetAttr, GetItem)):
+    while isinstance(target, (GetAttr, GetItem, WholeStorage)):
         target = target.variable
 
     if isinstance(target, Variable) and target.intent != "in":

@@ -40,6 +40,10 @@ class DataTypeMeta(type):
 
     def __call__(cls, *args, **kwargs):
         # StructType overrides this behaviour and must be instantiated normally
+        if cls._name in {"complex64", "complex128", "complex256"} and len(args) == 2:
+            from .ast.expressions import Complex
+
+            return Complex(args[0], args[1], dtype=cls)
         value = args[0] if args else kwargs.get("value", None)
         name = kwargs.get("name", None)
         from .wrappers.scalar import scalar

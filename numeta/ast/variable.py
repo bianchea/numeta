@@ -2,6 +2,7 @@ from .nodes import NamedEntity
 from .expressions import ExpressionNode
 from numeta.array_shape import ArrayShape, SCALAR
 from numeta.settings import settings
+from numeta.exceptions import NumetaTypeError, raise_with_source
 
 
 class Variable(NamedEntity, ExpressionNode):
@@ -130,6 +131,51 @@ class Variable(NamedEntity, ExpressionNode):
             Assignment(self, value)
         else:
             Assignment(self[key], value)
+
+    def _reject_bare_inplace(self, operator):
+        raise_with_source(
+            NumetaTypeError,
+            f"Bare Variable '{operator}=' is ambiguous in traced code. "
+            f"Use 'x = x {operator} y' to build an expression, or "
+            f"'x[:] {operator}= y' to perform a runtime update.",
+            source_node=self,
+        )
+
+    def __iadd__(self, other):
+        self._reject_bare_inplace("+")
+
+    def __isub__(self, other):
+        self._reject_bare_inplace("-")
+
+    def __imul__(self, other):
+        self._reject_bare_inplace("*")
+
+    def __itruediv__(self, other):
+        self._reject_bare_inplace("/")
+
+    def __ifloordiv__(self, other):
+        self._reject_bare_inplace("//")
+
+    def __imod__(self, other):
+        self._reject_bare_inplace("%")
+
+    def __ilshift__(self, other):
+        self._reject_bare_inplace("<<")
+
+    def __irshift__(self, other):
+        self._reject_bare_inplace(">>")
+
+    def __ixor__(self, other):
+        self._reject_bare_inplace("^")
+
+    def __iand__(self, other):
+        self._reject_bare_inplace("&")
+
+    def __ior__(self, other):
+        self._reject_bare_inplace("|")
+
+    def __ipow__(self, other):
+        self._reject_bare_inplace("**")
 
     def copy(self):
         return Variable(

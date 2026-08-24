@@ -3,7 +3,6 @@
 from numeta.datatype import float32, float64, get_datatype, int32
 from numeta.type_rules import is_vector_dtype
 
-from .scalar import scalar
 from .simd import VCvtF32ToF64, VCvtF64ToF32, VCvtF64ToI32, VCvtI32ToF64
 
 
@@ -24,6 +23,6 @@ def astype(value, dtype):
             )
         return conversion(value)
 
-    result = scalar(dtype)
-    result[:] = value
-    return result
+    from numeta.ast.expressions import Cast
+
+    return Cast(value, dtype)

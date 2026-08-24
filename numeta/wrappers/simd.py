@@ -79,7 +79,14 @@ def compare(a, b, predicate):
 
 
 def where(mask, when_true, when_false):
-    return VBlend(when_false, when_true, mask)
+    from numeta.ast.expressions import Select
+    from numeta.type_rules import is_vector_dtype
+
+    if any(
+        is_vector_dtype(getattr(value, "dtype", None)) for value in (mask, when_true, when_false)
+    ):
+        return VBlend(when_false, when_true, mask)
+    return Select(mask, when_true, when_false)
 
 
 def mask_bits(mask):

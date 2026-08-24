@@ -68,6 +68,12 @@ from .exceptions import (
 )
 from .settings import settings
 from ._version import __version__
+import math as _math
+
+pi = _math.pi
+e = _math.e
+inf = _math.inf
+nan = _math.nan
 
 from . import ast as _ast
 from . import wrappers as _wrappers
@@ -132,6 +138,10 @@ __all__ = [
     "jit",
     "logical1",
     "make_vector_type",
+    "pi",
+    "e",
+    "inf",
+    "nan",
     "omp",
     "ptr",
     "r16",
@@ -148,6 +158,6 @@ __all__ = [
 
 __all__ = list(dict.fromkeys(__all__))
 
-del _ast, _public_name, _wrappers
+del _ast, _math, _public_name, _wrappers
 
 settings.initialize_default_datatypes()

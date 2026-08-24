@@ -8,7 +8,7 @@ def _read_generated_source(tmp_path: Path, func_name: str, backend: str) -> str:
     return (tmp_path / f"{func_name}_src.{suffix}").read_text()
 
 
-def test_scalar_accumulator_rebinding_does_not_materialize_loop(tmp_path, backend):
+def test_scalar_accumulator_uses_explicit_runtime_updates(tmp_path, backend):
     func_name = f"rebind_accumulator_{backend}"
 
     @nm.jit(backend=backend, directory=str(tmp_path), namer=lambda *spec: func_name)
@@ -16,9 +16,9 @@ def test_scalar_accumulator_rebinding_does_not_materialize_loop(tmp_path, backen
         for i_batch in nm.range(result_stack.shape[0]):
             for result_index in nm.range(result_stack.shape[1]):
                 for flat_index in nm.range(result_stack.shape[2]):
-                    value = shell_result_stack[i_batch, result_index, 0, flat_index]
+                    value = nm.scalar(shell_result_stack[i_batch, result_index, 0, flat_index])
                     for i_thread in nm.range(1, shell_result_stack.shape[2]):
-                        value += shell_result_stack[i_batch, result_index, i_thread, flat_index]
+                        value[:] += shell_result_stack[i_batch, result_index, i_thread, flat_index]
                     result_stack[i_batch, result_index, flat_index] = value
 
     shell_result_stack = np.zeros((2, 3, 4, 5), dtype=np.float64, order="F")
@@ -38,10 +38,10 @@ def test_scalar_accumulator_rebinding_does_not_materialize_loop(tmp_path, backen
     if backend == "fortran":
         assert "do fc_i4 = 1_c_int64_t" in source
         assert "end do\n                result_stack" in source
-        assert "fc_s" not in source
+        assert "fc_s" in source
     else:
         assert "for (fc_i4 = 1;" in source
-        assert "fc_s" not in source
+        assert "fc_s" in source
 
 
 def test_scalar_accumulator_with_explicit_storage(backend):

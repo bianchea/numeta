@@ -2,7 +2,6 @@ import numeta as nm
 import numpy as np
 import pytest
 
-
 CASES = [
     pytest.param("add", 10.0, 16.0, id="add"),
     pytest.param("sub", 6.0, 0.0, id="sub"),
@@ -109,10 +108,12 @@ def test_scalar_loop_augassign_requires_explicit_slice(
     rebound_out = np.zeros(1, dtype=np.float64)
     materialized_out = np.zeros(1, dtype=np.float64)
 
-    rebound_kernel(4, rebound_out)
+    with pytest.raises(nm.NumetaTypeError, match=r"Bare Variable.*runtime update") as exc_info:
+        rebound_kernel(4, rebound_out)
+    assert "x = x" in str(exc_info.value)
+    assert "x[:]" in str(exc_info.value)
     materialized_kernel(4, materialized_out)
 
-    np.testing.assert_allclose(rebound_out, np.array([rebound_expected], dtype=np.float64))
     np.testing.assert_allclose(
         materialized_out, np.array([materialized_expected], dtype=np.float64)
     )

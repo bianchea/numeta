@@ -53,7 +53,7 @@ def test_specialize_supports_comptime_keyword_and_return_metadata(tmp_path, back
     def scaled_sum(count: nm.comptime, a, *, scale):
         result = nm.float64(0)
         for i in range(count):
-            result += a[i] * scale
+            result[:] += a[i] * scale
         return result
 
     specialization = scaled_sum.specialize(3, nm.float64[:], scale=float)

@@ -157,7 +157,7 @@ def test_call_matmul(backend):
 
     @nm.jit(backend=backend)
     def caller(a, b, c):
-        callee(c, nm.Matmul(b, a))
+        callee(c, nm.Matmul(a, b))
 
     n = 10
     a = np.random.random((n, n))

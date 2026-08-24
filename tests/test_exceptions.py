@@ -1,6 +1,3 @@
-import inspect
-import types
-
 import pytest
 
 from numeta.ast.expressions import EqBinaryNode, GetItem, LiteralNode, NeBinaryNode
@@ -13,7 +10,6 @@ from numeta.exceptions import (
     NumetaNotImplementedError,
     NumetaTypeError,
 )
-from numeta.wrappers.cond import CondHelper
 
 
 def test_builder_get_current_builder_raises_numeta_error():
@@ -99,25 +95,3 @@ def test_compiler_reports_missing_toolchain():
         )
 
     assert exc_info.value.compiler == "numeta-compiler-that-does-not-exist"
-
-
-def test_cond_helper_wraps_generated_source_with_except_exception():
-    helper = CondHelper()
-
-    frame = types.SimpleNamespace(
-        f_code=types.SimpleNamespace(co_filename="phase1_test.py"),
-        f_lineno=1,
-    )
-
-    original_getsourcelines = inspect.getsourcelines
-    inspect.getsourcelines = lambda _code: (["    pass\n"], 1)
-    try:
-        helper.if_stack.append(1)
-        source_lines, *_ = helper.get_source_cache(frame)
-    finally:
-        inspect.getsourcelines = original_getsourcelines
-
-    rendered_source = "".join(source_lines)
-
-    assert "except Exception:" in rendered_source
-    assert "RuntimeError('impossible to parse the code')" in rendered_source

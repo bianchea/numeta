@@ -39,6 +39,7 @@ class ExternalLibraryWrapper(ExternalLibrary):
         argtypes: Sequence[Arg | DataType | ArrayType | PointerType | FortranType | type],
         restype: DataType | ArrayType | FortranType | type | None,
         bind_c: bool = True,
+        pure: bool = False,
     ) -> None:
         symbolic_arguments = []
         for i, arg in enumerate(argtypes):
@@ -61,6 +62,7 @@ class ExternalLibraryWrapper(ExternalLibrary):
             return_type = convert_argument("res0", restype, bind_c=bind_c).dtype
 
         self.methods.add_method(name, symbolic_arguments, return_type, bind_c=bind_c)
+        self.methods.procedures[name].pure = bool(pure)
 
     def __getattr__(self, name: str):
         try:

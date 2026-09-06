@@ -180,6 +180,7 @@ class Settings:
         c_allow_vla_temporaries=False,
         c_compiler=None,
         fortran_compiler=None,
+        performance_warning_threshold=5000,
     ):
         """Initialize the settings.
         Parameters
@@ -216,6 +217,7 @@ class Settings:
             If True, runtime-sized internal C temporaries may be emitted as variable-length arrays.
         """
         self.iso_C = iso_C
+        self.performance_warning_threshold = performance_warning_threshold
 
         # Shared syntax settings for all backends.
         # If iso_C, start with C-like settings, otherwise Fortran-like.

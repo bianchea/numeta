@@ -26,5 +26,8 @@ def range(*args, name: str | None = None) -> Iterator[Variable]:
     builder = BuilderHelper.get_current_builder()
     I = builder.generate_local_variables("fc_i", name=name, dtype=settings.syntax.DEFAULT_INT)
 
-    with For(I, start, stop - 1, step=step):
+    loop = For(I, start, stop - 1, step=step)
+    builder.pending_iterators[id(loop)] = loop
+    with loop:
         yield I
+        builder.pending_iterators.pop(id(loop))

@@ -9,6 +9,11 @@ class FunctionCall(ExpressionNode):
         super().__init__()
         self.function = function
         self.arguments = [check_node(arg) for arg in arguments]
+        from numeta.builder_helper import BuilderHelper
+
+        builder = BuilderHelper.current_builder
+        if builder is not None and not getattr(function, "pure", False):
+            builder.effectful_calls.append(self)
 
     @property
     def dtype(self):

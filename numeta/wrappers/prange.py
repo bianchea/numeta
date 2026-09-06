@@ -26,5 +26,8 @@ def prange(*args, **kwargs: Any) -> Iterator[Variable]:
     builder = BuilderHelper.get_current_builder()
     I = builder.generate_local_variables("fc_i", dtype=settings.syntax.DEFAULT_INT)
 
-    with omp.parallel_for(I, start, stop - 1, step=step, **kwargs):
+    loop = omp.parallel_for(I, start, stop - 1, step=step, **kwargs)
+    builder.pending_iterators[id(loop)] = loop
+    with loop:
         yield I
+        builder.pending_iterators.pop(id(loop))

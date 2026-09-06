@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
 import sys
+from itertools import count
 
 
 _TRACK_SOURCE_LOCATION = True
+_TRACE_SEQUENCE = count()
 _INTERNAL_AST = "numeta/ast/"
 _INTERNAL_WRAPPERS = "numeta/wrappers/"
 _INTERNAL_BUILDER = "numeta/builder_helper.py"
@@ -20,6 +22,10 @@ def set_source_location_tracking(enabled: bool) -> None:
 class Node(ABC):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._trace_sequence = next(_TRACE_SEQUENCE)
+        from numeta.ast.scope import Scope
+
+        self._trace_scope = Scope.current_scope
         if _TRACK_SOURCE_LOCATION:
             self._source_location = self._capture_source_location()
         else:
@@ -39,6 +45,8 @@ class Node(ABC):
                     or _INTERNAL_IR in filename
                     or _INTERNAL_C in filename
                     or _INTERNAL_FORTRAN in filename
+                    or "numeta/datatype.py" in filename
+                    or "numeta/trace_validation.py" in filename
                 )
                 if not is_numeta_internal:
                     return {

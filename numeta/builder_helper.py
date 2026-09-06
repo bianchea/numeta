@@ -7,6 +7,7 @@ import numpy as np
 
 class BuilderHelper:
     current_builder = None
+    active_builds = []
 
     @classmethod
     def set_current_builder(cls, builder):
@@ -25,6 +26,8 @@ class BuilderHelper:
 
         self.prefix_counter = {}
         self.allocated_arrays = {}
+        self.effectful_calls = []
+        self.pending_iterators = {}
 
         if self.numeta_function.backend == "c" or settings.use_numpy_allocator:
             self.allocate_array = self._allocate_array_numpy
@@ -184,13 +187,30 @@ class BuilderHelper:
         return ArrayShape(normalized_dims, fortran_order=shape.fortran_order)
 
     def build(self, *args, **kwargs):
+        from .trace_validation import validate_trace
+
         old_builder = self.current_builder
         self.set_current_builder(self)
+        self.active_builds.append(self.numeta_function)
 
         old_scope = Scope.current_scope
         self.symbolic_function.scope.enter()
         try:
             return_variables = self.numeta_function.run_symbolic(*args, **kwargs)
+            if self.pending_iterators:
+                from .exceptions import raise_with_source
+
+                raise_with_source(
+                    NumetaError,
+                    "A Numeta loop iterator was abandoned during tracing, usually by Python "
+                    "break or return. Use nm.Break() or a void nm.Return() inside explicit "
+                    "Numeta control flow.",
+                    source_node=next(iter(self.pending_iterators.values())),
+                )
+            if Scope.current_scope is not self.symbolic_function.scope:
+                raise NumetaError(
+                    "Unbalanced Numeta scopes. Use with nm.If/While for control flow."
+                )
 
             if return_variables is None:
                 return_variables = []
@@ -292,11 +312,13 @@ class BuilderHelper:
             for array in self.allocated_arrays.values():
                 self.deallocate_array(array)
 
+            validate_trace(self)
             return ret
         finally:
             self.symbolic_function.scope.exit()
             Scope.current_scope = old_scope
             self.set_current_builder(old_builder)
+            self.active_builds.pop()
 
     def inline(self, function, *arguments):
         """Inline ``function`` with the given ``arguments`` into the current scope."""

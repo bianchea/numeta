@@ -63,6 +63,7 @@ from .exceptions import (
     LibraryFormatError,
     NumetaError,
     NumetaNotImplementedError,
+    NumetaPerformanceWarning,
     NumetaTypeError,
     ToolchainNotFoundError,
 )
@@ -98,6 +99,7 @@ __all__ = [
     "NumetaError",
     "NumetaLibrary",
     "NumetaNotImplementedError",
+    "NumetaPerformanceWarning",
     "NumetaSpecialization",
     "NumetaTypeError",
     "PointerType",

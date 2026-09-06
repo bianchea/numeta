@@ -1133,6 +1133,11 @@ class NumetaFunction(BaseFunction):
         forced_name: str | None = None,
         allow_existing_name: bool = False,
     ):
+        if any(function is self for function in BuilderHelper.active_builds):
+            raise RuntimeError(
+                f"Recursive Numeta call to {self.name!r} is unsupported. Use an explicit "
+                "nm.range or nm.While loop instead."
+            )
         with _directory_build_lock(self.directory):
             return self._construct_compiled_target_locked(
                 signature,

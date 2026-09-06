@@ -4,6 +4,10 @@ class NumetaError(Exception):
     pass
 
 
+class NumetaPerformanceWarning(UserWarning):
+    """A valid trace may be expensive to generate or compile."""
+
+
 class CompilationError(NumetaError):
     """Error during compilation."""
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any
 
 from numeta.builder_helper import BuilderHelper
-from numeta.datatype import DataType, get_datatype
+from numeta.datatype import get_datatype
 from numeta.ast.tools import check_node
 from numeta.array_shape import ArrayShape
 from numeta.ast.variable import Variable
@@ -12,6 +12,12 @@ _MISSING = object()
 
 
 def _is_dtype(value: Any) -> bool:
+    import numpy as np
+    from numeta.fortran.fortran_type import FortranType
+    from numeta.ast.types import Type
+
+    if not isinstance(value, (type, np.dtype, FortranType, Type)):
+        return False
     try:
         get_datatype(value)
     except (TypeError, ValueError, AttributeError):
@@ -31,7 +37,9 @@ def scalar(
     Both the value-first API (``scalar(value, dtype=...)``) and the historical
     dtype-first API (``scalar(dtype, value)``) are supported.
     """
-    if value is not _MISSING:
+    if value is not _MISSING and value_or_dtype is _MISSING and dtype is not None:
+        initializer = _MISSING if value is None else value
+    elif value is not _MISSING:
         if value_or_dtype is _MISSING or not _is_dtype(value_or_dtype):
             raise TypeError("scalar(dtype, value) requires a dtype as its first argument")
         if dtype is not None:

@@ -7,6 +7,12 @@ from numeta.indexing import get_slice_dim, merge_slices, merge_scalar_index
 class GetItem(ExpressionNode):
     def __init__(self, variable, slice_):
         super().__init__()
+        if variable._shape.is_scalar:
+            from numeta.exceptions import NumetaTypeError
+
+            raise_with_source(
+                NumetaTypeError, "Scalar storage cannot be indexed. Use scalar[:].", self
+            )
         self.variable = variable
         # define if only a slice [begin : end : step] of the Variable is asked
         self.sliced = slice_

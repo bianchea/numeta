@@ -309,6 +309,16 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
         if expr_type is intrinsic_type or isinstance(expr, intrinsic_type):
             token = getattr(expr, "token", "")
             args = [lower_expr(arg) for arg in expr.arguments]
+            if (
+                token == "round_even"
+                and getattr(expr.arguments[0].dtype, "_name", "").startswith("int")
+                and (expr.ndigits is None or expr.ndigits >= 0)
+            ):
+                # Already-integral values must not lose precision through a real
+                # intermediate, especially above the exact float64 integer range.
+                return IRIntrinsic(
+                    name="astype", args=args[:1], vtype=_get_vtype(expr), source=expr
+                )
             if token == "-" and len(args) == 1:
                 return IRUnary(
                     op="neg",

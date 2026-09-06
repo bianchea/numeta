@@ -319,6 +319,11 @@ class Round(IntrinsicFunction):
 
         return settings.syntax.DEFAULT_INTEGER
 
+    def get_with_updated_variables(self, variables_couples):
+        return type(self)(
+            self.arguments[0].get_with_updated_variables(variables_couples), self.ndigits
+        )
+
 
 class Cast(UnaryIntrinsicFunction):
     token = "astype"

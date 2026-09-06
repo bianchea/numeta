@@ -396,32 +396,41 @@ class FortranEmitter:
 
             if expr.name == "round_even":
                 value = self._expr_blocks(expr.args[0])
+                kind = ["kind(", *value, ")"]
+                one = ["real(1,kind=", *kind, ")"]
+                two = ["real(2,kind=", *kind, ")"]
+                half = ["real(0.5,kind=", *kind, ")"]
                 scale = (
-                    ["1.0"]
+                    one
                     if len(expr.args) == 1
-                    else ["(10.0**", *self._expr_blocks(expr.args[1]), ")"]
+                    else ["(real(10,kind=", *kind, ")**", *self._expr_blocks(expr.args[1]), ")"]
                 )
                 scaled = ["(", *value, "*", *scale, ")"]
+                magnitude = ["abs(", *scaled, ")"]
+                # ANINT returns a real, avoiding default-integer overflow. It
+                # rounds ties away from zero; correct the even-lower halfway
+                # cases and restore the sign (including a rounded negative zero).
+                nearest = ["anint(", *magnitude, ")"]
                 rounded = [
-                    "merge(floor(",
+                    "sign(merge(",
+                    *nearest,
+                    "-",
+                    *one,
+                    ",",
+                    *nearest,
+                    ",modulo(",
+                    *magnitude,
+                    ",",
+                    *two,
+                    ")==",
+                    *half,
+                    "),",
                     *scaled,
-                    "),ceiling(",
-                    *scaled,
-                    "),(",
-                    *scaled,
-                    "-floor(",
-                    *scaled,
-                    ")<0.5).or.(",
-                    *scaled,
-                    "-floor(",
-                    *scaled,
-                    ")==0.5.and.modulo(floor(",
-                    *scaled,
-                    "),2)==0))",
+                    ")",
                 ]
                 if len(expr.args) == 1:
-                    return ["int(", *rounded, ")"]
-                return ["real(", *rounded, ",kind=kind(", *value, "))/", *scale]
+                    return ["int(", *rounded, ",kind=", str(expr.vtype.dtype.kind), ")"]
+                return ["(", *rounded, "/", *scale, ")"]
 
             if expr.name == "astype":
                 dtype = expr.vtype.dtype

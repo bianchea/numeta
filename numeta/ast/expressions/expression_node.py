@@ -47,7 +47,9 @@ class ExpressionNode(Node):
     def __bool__(self) -> bool:
         raise_with_source(
             NumetaTypeError,
-            "Do not use 'bool' operator for expressions.",
+            "Do not use 'bool' operator for expressions. Python and/or/not, chained "
+            "comparisons and ternary expressions cannot trace runtime conditions. Use "
+            "parenthesized comparisons with &, |, ~, nm.minimum/nm.maximum, or with nm.If/Else.",
             source_node=self,
         )
 
@@ -194,6 +196,7 @@ class ExpressionNode(Node):
 
     def __invert__(self):
         from numeta.datatype import bool8
+        from .intrinsic_functions import Not
 
         return Not(self) if self.dtype is bool8 else BinaryOperationNode(self, "^", -1)
 

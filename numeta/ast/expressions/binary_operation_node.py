@@ -72,6 +72,10 @@ class EqBinaryNode(BinaryOperationNode):
         self._shape_cache = None
 
     def __bool__(self):
+        from numeta.builder_helper import BuilderHelper
+
+        if BuilderHelper.current_builder is not None:
+            return ExpressionNode.__bool__(self)
         try:
             return self.left.name == self.right.name
         except AttributeError:
@@ -94,6 +98,10 @@ class NeBinaryNode(BinaryOperationNode):
         self._shape_cache = None
 
     def __bool__(self):
+        from numeta.builder_helper import BuilderHelper
+
+        if BuilderHelper.current_builder is not None:
+            return ExpressionNode.__bool__(self)
         try:
             return self.left.name != self.right.name
         except AttributeError:

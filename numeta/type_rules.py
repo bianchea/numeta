@@ -45,6 +45,10 @@ def vector_common_dtype(*dtypes):
 
 def binary_result_dtype(left_dtype, right_dtype, op):
     if not (is_vector_dtype(left_dtype) or is_vector_dtype(right_dtype)):
+        if op in _COMPARISON_OPS or op in _LOGICAL_OPS:
+            from .datatype import bool8
+
+            return bool8
         return left_dtype
     if op in _COMPARISON_OPS or op in _LOGICAL_OPS:
         raise TypeError("Vector comparisons and logical operations are not supported yet")

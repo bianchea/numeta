@@ -26,11 +26,14 @@ allocate an array and assign through `[:]` instead.
 | `x += y` on bare storage | Error; choose an expression or an explicit store |
 | `scalar[0]` | Error; scalar storage only supports `scalar[:]` |
 
-An expression is not a snapshot of its inputs. A trace that constructs a scalar
+An expression is not a snapshot of its inputs. A trace that constructs an
 expression, overwrites one of its scalar dependencies, and then consumes that
 expression is rejected when the intervening write provably dominates the use.
+This also detects constant-index array-element reads followed by a write to that
+same element or the whole array. Disjoint constant-index writes remain valid.
 The diagnostic identifies both locations and suggests `nm.scalar(expr)`.
-This check is conservative: it is not a general array-alias or control-flow proof.
+This bounded check does not prove overlap for runtime indices, partial slices,
+different array arguments sharing memory, or general control-flow paths.
 
 ## Effects and output
 

@@ -1,6 +1,7 @@
 """Read-only checks on the completed trace; never schedule or materialize expressions."""
 
 from collections import Counter
+from numbers import Integral
 import warnings
 
 from .ast.expressions import (
@@ -57,6 +58,32 @@ def storage_base(node):
     return node if isinstance(node, Variable) else None
 
 
+def constant_array_element(node):
+    """Identify a full constant-index access, without assuming runtime aliasing."""
+    if not isinstance(node, GetItem):
+        return None
+    base = node.variable
+    while isinstance(base, WholeStorage):
+        base = base.variable
+    if not isinstance(base, Variable) or base._shape.is_scalar or base._shape.is_unknown:
+        return None
+    indices = node.sliced if isinstance(node.sliced, tuple) else (node.sliced,)
+    if len(indices) != base._shape.rank:
+        return None
+    indices = tuple(index.value if isinstance(index, LiteralNode) else index for index in indices)
+    if not all(isinstance(index, Integral) for index in indices):
+        return None
+    return id(base), tuple(int(index) for index in indices)
+
+
+def array_write_key(target):
+    while isinstance(target, WholeStorage):
+        target = target.variable
+    if isinstance(target, Variable) and not target._shape.is_scalar:
+        return id(target), None  # A whole-array overwrite overlaps every element.
+    return constant_array_element(target)
+
+
 def validate_trace(builder):
     uses = Counter()
     count = 0
@@ -73,12 +100,16 @@ def validate_trace(builder):
                 )
             if target or isinstance(node, (Variable, LiteralNode)):
                 continue
-            # Prove only scalar storage dependencies. Array aliasing and writes
-            # to disjoint indices require a separate overlap analysis.
+            dependencies = []
             for dependency in walk_expression(node):
                 if not isinstance(dependency, Variable) or not dependency._shape.is_scalar:
                     continue
-                write = writes.get(id(dependency))
+                dependencies.append(id(dependency))
+            element = constant_array_element(node)
+            if element is not None:
+                dependencies.extend((element, (element[0], None)))
+            for dependency in dependencies:
+                write = writes.get(dependency)
                 if write is not None and node._trace_sequence < write._trace_sequence:
                     write_location = format_source_location(write) or "location unavailable"
                     raise_with_source(
@@ -106,6 +137,10 @@ def validate_trace(builder):
                         statement,
                     )
                 consume(statement.target, statement, writes, target=True)
+                # A storage target is not a read, but its index expressions are.
+                for node in walk_expression(statement.target):
+                    if isinstance(node, GetItem):
+                        consume(node.sliced, statement, writes)
                 consume(statement.value, statement, writes)
                 target_shape = statement.target._shape
                 value_shape = statement.value._shape
@@ -117,6 +152,10 @@ def validate_trace(builder):
                     )
                 if base._shape.is_scalar:
                     writes[id(base)] = statement
+                else:
+                    key = array_write_key(statement.target)
+                    if key is not None:
+                        writes[key] = statement
             else:
                 for child in statement.children:
                     consume(child, statement, writes)

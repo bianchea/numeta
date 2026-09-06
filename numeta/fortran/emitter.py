@@ -123,7 +123,13 @@ class FortranEmitter:
     def _emit_stmt(self, stmt, *, indent: int) -> list[str]:
         stmt_type = type(stmt)
         if stmt_type is IRAssign:
-            blocks = self._expr_blocks(stmt.target) + ["="] + self._expr_blocks(stmt.value)
+            target_shape = stmt.target.vtype.shape if stmt.target.vtype else None
+            value = (
+                self._expr_blocks_in_order(stmt.value, target_shape.order)
+                if target_shape is not None and target_shape.rank == 2
+                else self._expr_blocks(stmt.value)
+            )
+            blocks = self._expr_blocks(stmt.target) + ["="] + value
             return [print_block(blocks, indent=indent)]
         if stmt_type is IRCall:
             blocks = ["call", " "] + self._expr_blocks(stmt.func) + ["("]
@@ -241,6 +247,13 @@ class FortranEmitter:
         ):
             return True
         return False
+
+    def _expr_blocks_in_order(self, expr: IRExpr, order: str) -> list[str]:
+        blocks = self._expr_blocks(expr)
+        shape = expr.vtype.shape if expr.vtype else None
+        if shape is not None and shape.rank == 2 and shape.order != order:
+            return ["transpose(", *blocks, ")"]
+        return blocks
 
     def _expr_blocks(self, expr: IRExpr | None) -> list[str]:
         if expr is None:
@@ -439,23 +452,21 @@ class FortranEmitter:
                 ]
 
             if expr.name == "matmul":
-                # Numeta's public dimensions are C/Python ordered while the
-                # Fortran view reverses those dimensions. Reversing the native
-                # operands preserves the public ``matmul(a, b)`` contract.
+                # C-ordered matrices are represented by their transposes in Fortran.
+                # Normalize operands to the declared result order, then use
+                # (A B)^T = B^T A^T for a C-ordered result, including mixed layouts.
                 left, right = expr.args
-                left_shape = left.vtype.shape if left.vtype is not None else None
-                right_shape = right.vtype.shape if right.vtype is not None else None
-                native_args = (
-                    (left, right)
-                    if getattr(left_shape, "order", None) == "F"
-                    and getattr(right_shape, "order", None) == "F"
-                    else (right, left)
-                )
+                shape = expr.vtype.shape if expr.vtype else None
+                if shape is None:
+                    # Python matmul does not conjugate complex vectors.
+                    return ["sum(", *self._expr_blocks(left), "*", *self._expr_blocks(right), ")"]
+                order = shape.order if shape.rank == 2 else "F"
+                native_args = (right, left) if order == "C" else (left, right)
                 return [
                     "matmul(",
-                    *self._expr_blocks(native_args[0]),
+                    *self._expr_blocks_in_order(native_args[0], order),
                     ",",
-                    *self._expr_blocks(native_args[1]),
+                    *self._expr_blocks_in_order(native_args[1], order),
                     ")",
                 ]
 

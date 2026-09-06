@@ -578,15 +578,28 @@ class Matmul(BinaryIntrinsicFunction):
 
     @property
     def _shape(self):
+        if self._shape_cache is not None:
+            return self._shape_cache
         a_shape = self.arguments[0]._shape
         b_shape = self.arguments[1]._shape
+        if any(shape.is_unknown or shape.rank not in (1, 2) for shape in (a_shape, b_shape)):
+            from numeta.exceptions import NumetaTypeError
+
+            raise_with_source(
+                NumetaTypeError,
+                "nm.matmul requires rank-1 or rank-2 arrays; use explicit loops for batched matrices.",
+                source_node=self,
+            )
         if a_shape.rank == 1 and b_shape.rank == 1:
-            return SCALAR
-        if a_shape.rank == 1:
-            return ArrayShape((b_shape.dim(1),))
-        if b_shape.rank == 1:
-            return ArrayShape((a_shape.dim(0),))
-        return ArrayShape((a_shape.dim(0), b_shape.dim(1)))
+            shape = SCALAR
+        elif a_shape.rank == 1:
+            shape = ArrayShape((b_shape.dim(1),))
+        elif b_shape.rank == 1:
+            shape = ArrayShape((a_shape.dim(0),))
+        else:
+            shape = ArrayShape((a_shape.dim(0), b_shape.dim(1)))
+        self._shape_cache = shape
+        return shape
 
 
 # Aliases to match numpy conventions

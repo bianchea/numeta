@@ -2158,7 +2158,9 @@ class CEmitter:
         self._tmp_counter += 1
         temp_name = f"_nm_tmp_{self._tmp_counter}"
         size = self._render_product(dims)
-        ctype = self._map_irvar_to_ctype(IRVar(name=temp_name, vtype=expr.vtype))
+        ctype = self._map_irvar_to_ctype(
+            IRVar(name=temp_name, vtype=expr.vtype, source=expr.source)
+        )
 
         pre_lines, post_lines = self._render_temp_buffer(
             temp_name, ctype, size, indent, origin=expr

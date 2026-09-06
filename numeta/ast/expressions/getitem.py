@@ -85,9 +85,25 @@ class GetItem(ExpressionNode):
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
+        if not any(field[0] == name for field in getattr(self.dtype, "_members", ())):
+            raise AttributeError(name)
         from .getattr import GetAttr
 
         return GetAttr(self, name)
+
+    def __setattr__(self, name, value):
+        if (
+            name not in {"variable", "sliced"}
+            and not name.startswith("_")
+            and "variable" in self.__dict__
+        ):
+            if any(field[0] == name for field in getattr(self.dtype, "_members", ())):
+                from numeta.ast.statements import Assignment
+                from .getattr import GetAttr
+
+                Assignment(GetAttr(self, name), value)
+                return
+        super().__setattr__(name, value)
 
     def get_with_updated_variables(self, variables_couples):
 

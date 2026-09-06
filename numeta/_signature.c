@@ -1116,6 +1116,11 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
             
             if (func) {
                 // Cache hit - call directly
+                if (PyObject_SetAttrString((PyObject*)self, "_last_signature", sig_tuple) < 0) {
+                    Py_DECREF(sig_tuple);
+                    Py_XDECREF(tmp_kwargs);
+                    return NULL;
+                }
                 Py_DECREF(sig_tuple);  // We don't need this anymore
                 Py_XDECREF(tmp_kwargs);
                 return PyObject_Vectorcall(func, runtime_args, (size_t)parsed_nruntime, NULL);
@@ -1203,6 +1208,11 @@ static PyObject *BaseFunction_call(BaseFunctionObject *self, PyObject *args, PyO
     }
 
     // --- Cache Hit: Vectorcall ---
+    if (PyObject_SetAttrString((PyObject*)self, "_last_signature", result.sig_tuple) < 0) {
+        _parse_result_cleanup(&result);
+        Py_DECREF(result.sig_tuple);
+        return NULL;
+    }
     ret_val = PyObject_Vectorcall(
         func,
         result.runtime_args_buf,

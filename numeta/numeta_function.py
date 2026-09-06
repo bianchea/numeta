@@ -566,6 +566,10 @@ class NumetaFunction(BaseFunction):
         """Read-only generated source mapping keyed by stable signature ID."""
         from .library_signature import signature_id
 
+        if not self._compiled_functions:
+            raise RuntimeError(
+                "Call the function or use specialize(...) before accessing .sources."
+            )
         return MappingProxyType(
             {
                 signature_id(signature): compiled.render_source()
@@ -1011,10 +1015,9 @@ class NumetaFunction(BaseFunction):
         if builder is not None:
             return self._handle_symbolic_call(signature, runtime_args)
 
+        self._last_signature = signature
         if not to_execute:
-            if signature not in self._compiled_functions:
-                self.construct_compiled_target(signature)
-            return self._compiled_functions[signature].symbolic_function
+            return self._handle_symbolic_call(signature, runtime_args)
 
         if signature in self._fast_call:
             return self._fast_call[signature](*runtime_args)

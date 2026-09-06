@@ -89,46 +89,30 @@ nm.settings.set_fortran_compiler("/opt/gcc/bin/gfortran")
 
 ## Quick Start
 
-Here's a quick example demonstrating how Numeta works:
+Use storage to evaluate a value at a particular point, and `[:]` to update it:
 
 ```python
 import numeta as nm
+import numpy as np
 
 @nm.jit
-def mixed_loops(n: nm.comptime, array) -> None:
-    for i in range(n):
-        for j in nm.range(n):
-            array[j, i] = i + j
+def positive_sum(values):
+    total = nm.scalar(0.0)
+    for i in nm.range(values.shape[0]):
+        sample = nm.scalar(values[i])
+        with nm.If(sample > 0):
+            total[:] += sample
+    return total
+
+values = np.array([-1.0, 2.0, 3.0])
+assert positive_sum(values) == 5.0
+print(positive_sum.source)
 ```
 
-This runs as normal Python code. The first loop (`n`) is compile-time and will be
-unrolled, while the second loop is compiled and executed as Fortran. The generated
-Fortran code looks like this:
-
-```fortran
-subroutine mixed_loops(array) bind(C)
-    use iso_c_binding, only: c_double
-    use iso_c_binding, only: c_int64_t
-    implicit none
-    real(c_double), dimension(0:9, 0:9), intent(inout) :: array
-    integer(c_int64_t) :: fc_i1
-    integer(c_int64_t) :: fc_i2
-    integer(c_int64_t) :: fc_i3
-    do fc_i1 = 0_c_int64_t, 2_c_int64_t
-        array(0, fc_i1) = (0_c_int64_t + fc_i1)
-    end do
-    do fc_i2 = 0_c_int64_t, 2_c_int64_t
-        array(1, fc_i2) = (1_c_int64_t + fc_i2)
-    end do
-    do fc_i3 = 0_c_int64_t, 2_c_int64_t
-        array(2, fc_i3) = (2_c_int64_t + fc_i3)
-    end do
-end subroutine mixed_loops
-```
-
-This is where one can appreciate the beauty of Fortran. Note that the indices are
-reversed because Fortran arrays are column-major, meaning the first index is the
-column and the second is the row.
+`positive_sum.source` displays the actual generated source for the most recently
+selected specialization. Use `@nm.jit(backend="c")` to select C. Pure expressions
+stay lazy: `alias = total + 1` builds an expression, not a snapshot. See the
+[Numeta Language Contract](LANGUAGE_CONTRACT.md) for assignment and control-flow rules.
 
 ## Usage
 
@@ -560,28 +544,16 @@ In this example:
 - The loop runs using `nm.range(n)` to generate a compiled loop that performs the operation.
 - Fortran implicit casting is used to convert `i` to the appropriate type for the array.
 
-Alternatively, you can use:
-
-```python
-@nm.jit
-def do_loop(n, array) -> None:
-    i = nm.scalar(nm.i8)
-    with nm.do(i, 0, n - 1):
-        array[i] = i * 2
-```
-
-This approach uses `nm.do` to emulate the Fortran `do` loop style.
-
 For mutable scalar state inside `@nm.jit`, prefer explicit indexed assignment:
 
 ```python
-acc = nm.scalar(nm.f8, 0.0)
+acc = nm.scalar(0.0)
 acc[:] += 1.0
 acc[:] *= 2.0
 ```
 
-The `[:]` is what materializes the write. Bare `acc += 1.0` only rebinds the
-Python local name.
+The `[:]` emits the write. Bare `acc += 1.0` raises with guidance; use
+`acc = acc + 1.0` to build a lazy expression instead.
 
 ### Conditional Statements
 
@@ -593,19 +565,15 @@ import numeta as nm
 @nm.jit
 def conditional_example(n, array) -> None:
     for i in nm.range(n):
-        if nm.cond(i < 1):
+        with nm.If(i < 1):
             array[i] = 0
-        elif nm.cond(i < 2):
+        with nm.ElseIf(i < 2):
             array[i] = 1
-        else:
+        with nm.Else():
             array[i] = 2
-        nm.endif()
 ```
 
-Note: You need to use `nm.endif()` at the end of the conditional block, though I'm working on improving this syntax to make it more intuitive.
-It is currently difficult to maintain Python-like syntax for generated conditional code because some branches may never be taken, which complicates the code generation and obligates to read the AST.
-
-Alternatively, you can use:
+The scopes also nest:
 
 ```python
 with nm.If(i < 3):
@@ -617,7 +585,8 @@ with nm.If(i < 3):
         array[i] = 2
 ```
 
-This approach is safer, albeit less elegant, and will generate the same code as the previous example without needing to read the AST.
+Every branch is traced explicitly; no Python source is parsed to discover branches.
+Use `&`, `|`, and `~` on parenthesized runtime comparisons.
 
 ### How to Link an External Library
 
@@ -629,23 +598,23 @@ import numeta as nm
 # Create an external library wrapper for BLAS
 blas = nm.ExternalLibraryWrapper("blas")
 
-# Add a method from LAPACK to the wrapper
+# This example targets the usual LP64 BLAS ABI (32-bit BLAS integers).
 blas.add_method(
     "dgemm",
     [
         nm.char,      # transa
         nm.char,      # transb
-        nm.i8,        # m
-        nm.i8,        # n
-        nm.i8,        # k
+        nm.i4,        # m
+        nm.i4,        # n
+        nm.i4,        # k
         nm.f8,        # alpha
         nm.f8[:],     # a
-        nm.i8,        # lda
+        nm.i4,        # lda
         nm.f8[:],     # b
-        nm.i8,        # ldb
+        nm.i4,        # ldb
         nm.f8,        # beta
         nm.f8[:],     # c
-        nm.i8         # ldc
+        nm.i4         # ldc
     ],
     None,
     bind_c=False
@@ -653,28 +622,22 @@ blas.add_method(
 
 @nm.jit
 def matmul(a, b, c):
-    # Call the linked LAPACK dgemm method
-    blas.dgemm("N",
-               "N",
-               b.shape[0],
-               a.shape[1],
-               c.shape[1],
-               1.0,
-               b,
-               b.shape[0],
-               a,
-               a.shape[0],
-               0.0,
-               c,
-               c.shape[0])
+    # a, b, and c must be Fortran-contiguous; c.shape == (a.shape[0], b.shape[1]).
+    m = nm.scalar(a.shape[0], dtype=nm.i4)
+    n = nm.scalar(b.shape[1], dtype=nm.i4)
+    k = nm.scalar(a.shape[1], dtype=nm.i4)
+    blas.dgemm("N", "N", m, n, k, 1.0, a, m, b, k, 0.0, c, m)
 ```
 
 In this example:
 
-- `blas = nm.ExternalLibraryWrapper("blas")` creates a wrapper for the LAPACK library.
+- `blas = nm.ExternalLibraryWrapper("blas")` creates a wrapper for the BLAS library.
 - `blas.add_method()` adds the `dgemm` method for matrix multiplication.
 - The method signature includes parameters such as matrix dimensions and scalars.
 - The `matmul` function then uses `blas.dgemm` to perform matrix multiplication.
+
+Use `np.asfortranarray(...)` for inputs and `np.zeros(..., order="F")` for the
+output. ILP64 BLAS builds require a different integer ABI; match your library.
 
 ### Parallel Loop Example
 
@@ -690,7 +653,7 @@ import numeta as nm
 
 @nm.jit
 def pmul(a, b, c):
-    for i in nm.prange(a.shape[0], default='private', shared=[a, b, c], schedule='static'):
+    for i in nm.prange(a.shape[0], schedule='static'):
         for k in nm.range(b.shape[0]):
             c[i, :] += a[i, k] * b[k, :]
 ```
@@ -698,8 +661,9 @@ def pmul(a, b, c):
 In this example:
 
 - `nm.prange(a.shape[0])` parallelizes the outer loop.
-- `default='private'` specifies that loop variables are private by default.
-- The `shared` list includes variables that are shared across threads.
+- The iterator and loop-local storage are private under `default(none)`.
+- Captured arrays, read-only scalars, and array shape descriptors are inferred shared.
+- Captured scalar writes require explicit `private=[...]` or an atomic update.
 - The `schedule='static'` controls the scheduling of loop iterations.
 
 ### Compile-Time Example

@@ -11,6 +11,7 @@ def test_omp(backend):
 
         for j in nm.prange(
             b.shape[1],
+            private=[i_thread],
             shared=[a, b, c, a.shape[0].variable, b.shape[0].variable],
             schedule="static",
         ):

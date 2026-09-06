@@ -1467,6 +1467,16 @@ class CEmitter:
             cond = f"{iterator} {condition} {end}"
             incr = f"{iterator} += {step}" if step != "1" else f"{iterator}++"
             lines = [f"{'    ' * indent}for ({init}; {cond}; {incr}) {{\n"]
+            if "openmp" in stmt.metadata:
+                from numeta.parallel import render_parallel
+
+                clauses = render_parallel(
+                    stmt.metadata["openmp"],
+                    lambda name: (
+                        f"{self._shape_arg_map[name]}_dims" if name in self._shape_arg_map else name
+                    ),
+                )
+                lines.insert(0, f"{'    ' * indent}#pragma omp parallel for {clauses}\n")
             lines.extend(self._render_statements(stmt.body, indent + 1))
             lines.append(f"{'    ' * indent}}}\n")
             return lines

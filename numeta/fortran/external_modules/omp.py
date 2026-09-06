@@ -21,37 +21,41 @@ class OmpFor(For):
     def __init__(
         self,
         *args,
-        default="private",
-        schedule="dynamic",
+        default="none",
+        schedule="static",
         private=None,
         shared=None,
+        chunk=None,
+        num_threads=None,
         **kwargs,
     ):
-        from numeta.fortran.fortran_syntax import render_expr_blocks
+        from numeta.parallel import parallel_options
 
-        omp_code = ["parallel do", " "]
-        omp_code += [f"default({default})", " "]
-        omp_code += [f"schedule({schedule})", " "]
-        if private is not None:
-            # TODO: Should we add automatically variables declared inside the loop?
-            omp_code += ["private("]
-            for var in private:
-                omp_code += render_expr_blocks(var)
-                omp_code += [", "]
-            omp_code[-1] = ")"
-        if shared is not None:
-            # TODO: Should we automatically array shapes if explicitly declared as variables?
-            omp_code += ["shared("]
-            for var in shared:
-                omp_code += render_expr_blocks(var)
-                omp_code += [", "]
-            omp_code[-1] = ")"
-        OmpComment(omp_code, add_to_scope=True)
+        self.openmp = parallel_options(
+            default=default,
+            schedule=schedule,
+            private=private,
+            shared=shared,
+            chunk=chunk,
+            num_threads=num_threads,
+        )
         super().__init__(*args, **kwargs)
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
-        OmpComment("end parallel do", add_to_scope=True)
+        if exc_type is None:
+            from numeta.parallel import finalize_parallel
+
+            finalize_parallel(self)
+
+    def get_with_updated_variables(self, variables_couples):
+        result = super().get_with_updated_variables(variables_couples)
+        result.openmp = dict(self.openmp)
+        for clause in ("shared", "private"):
+            result.openmp[clause] = [
+                v.get_with_updated_variables(variables_couples) for v in self.openmp[clause]
+            ]
+        return result
 
 
 class omp_get_thread_num(Function):
@@ -120,11 +124,12 @@ class OmpNamespace(ExternalNamespace):
         )
 
         Comment(f"$omp atomic update", add_to_scope=True)
-        Assignment(
+        statement = Assignment(
             variable,
             BinaryOperationNodeNoPar(variable, op, to_assign),
             add_to_scope=True,
         )
+        statement.atomic = True
 
     def atomic_update_add(self, variable, to_assign):
         self.atomic_update_op(variable, to_assign, "+")

@@ -387,6 +387,18 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                 step=lower_expr(stmt.step) if stmt.step is not None else None,
                 body=[lower_stmt(s) for s in stmt.scope.get_statements()],
                 source=stmt,
+                metadata=(
+                    {
+                        "openmp": {
+                            key: (
+                                [v.name for v in value] if key in {"shared", "private"} else value
+                            )
+                            for key, value in stmt.openmp.items()
+                        }
+                    }
+                    if hasattr(stmt, "openmp")
+                    else {}
+                ),
             )
         if isinstance(stmt, While):
             return IRWhile(

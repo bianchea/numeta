@@ -175,6 +175,23 @@ class FortranEmitter:
             for child in stmt.body:
                 lines.extend(self._emit_stmt(child, indent=indent + 1))
             lines.append(print_block(["end", " ", "do"], indent=indent))
+            if "openmp" in stmt.metadata:
+                from numeta.parallel import render_parallel
+
+                # Separate continued clauses keep OpenMP lines within Fortran's limit.
+                options = stmt.metadata["openmp"]
+                clauses = render_parallel(options)
+                words = clauses.split(" ")
+                directive = "    " * indent + "!$omp parallel do "
+                prefix = []
+                for word in words:
+                    if len(directive) + len(word) > 110:
+                        prefix.append(directive + "&\n")
+                        directive = "    " * indent + "!$omp& "
+                    directive += word + " "
+                prefix.append(directive.rstrip() + "\n")
+                lines = prefix + lines
+                lines.append("    " * indent + "!$omp end parallel do\n")
             return lines
         if stmt_type is IRWhile:
             blocks = ["do while", " ", "("] + self._expr_blocks(stmt.cond) + [")"]

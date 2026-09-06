@@ -266,7 +266,7 @@ class FortranEmitter:
             if expr.op == "shl":
                 return ["ishft(", *left, ",", *right, ")"]
             if expr.op == "shr":
-                return ["ishft(", *left, ",-(", *right, "))"]
+                return ["shifta(", *left, ",", *right, ")"]
             if expr.op in {"xor", "bitand", "bitor"}:
                 intrinsic = {"xor": "ieor", "bitand": "iand", "bitor": "ior"}[expr.op]
                 return [intrinsic, "(", *left, ",", *right, ")"]

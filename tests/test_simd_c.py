@@ -64,7 +64,7 @@ def test_avx2_table_and_exponent_intrinsics_emit():
         "_mm256_floor_pd",
         "_mm256_cvttpd_epi32",
         "_mm256_cvtepi32_pd",
-        "_mm_extract_epi32",
+        "nm_extract_i32_4",
         "_mm256_set_pd",
         "_mm256_cvtepi32_epi64",
         "_mm256_slli_epi64",

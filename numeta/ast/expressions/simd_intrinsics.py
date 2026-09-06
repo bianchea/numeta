@@ -237,9 +237,7 @@ class VExtractI32(IntrinsicFunction):
 
     @property
     def dtype(self):
-        from numeta import i4
-
-        return i4
+        return self.arguments[0].dtype.base_dtype()
 
     @property
     def _shape(self):

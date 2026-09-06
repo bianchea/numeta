@@ -26,6 +26,7 @@ INTRINSIC_HELPER_OPS = {
     "simd_unpack_low": "unpack_low",
     "simd_unpack_high": "unpack_high",
     "simd_pairwise_halves_sum": "pairwise_halves_sum",
+    "simd_extract_i32": "extract",
 }
 
 DIRECT_INTRINSIC_NAMES = frozenset(
@@ -41,7 +42,6 @@ DIRECT_INTRINSIC_NAMES = frozenset(
         "simd_compare",
         "simd_blend",
         "simd_movemask",
-        "simd_extract_i32",
         "simd_set4_f64",
         "simd_exp2_neg_i32",
     }
@@ -96,11 +96,6 @@ def render_direct_intrinsic(
             "neq": "_CMP_NEQ_OQ",
         }
         return f"_mm256_cmp_pd({args[0]}, {args[1]}, {predicates[metadata['predicate']]})"
-    if name == "simd_extract_i32":
-        lane = metadata["lane"]
-        if lane == 0:
-            return f"_mm_cvtsi128_si32({args[0]})"
-        return f"_mm_extract_epi32({args[0]}, {lane})"
     if name == "simd_set4_f64":
         return f"_mm256_set_pd({args[3]}, {args[2]}, {args[1]}, {args[0]})"
     if name == "simd_exp2_neg_i32":
@@ -201,7 +196,7 @@ def _helper_name_from_parts(op: str, base_dtype, lanes: int) -> str:
         return f"nm_vstore_{suffix}"
     if op == "reduce_sum":
         return f"nm_reduce_sum_{suffix}"
-    if op in {"unpack_low", "unpack_high", "pairwise_halves_sum"}:
+    if op in {"unpack_low", "unpack_high", "pairwise_halves_sum", "extract"}:
         return f"nm_{op}_{suffix}"
     raise NotImplementedError(f"Unsupported SIMD helper op: {op}")
 
@@ -247,6 +242,7 @@ def render_helpers(vector_dtypes, helper_ops, target: SimdTarget) -> list[str]:
         "sqrt",
         "fma",
         "reduce_sum",
+        "extract",
         "unpack_low",
         "unpack_high",
         "pairwise_halves_sum",
@@ -293,6 +289,17 @@ def _native_candidates(arch: str, base_dtype) -> tuple[tuple[int, str], ...]:
 
 
 def _render_helper(op: str, abi: LoweredVectorABI) -> list[str]:
+    if op == "extract":
+        name = _abi_helper_name(op, abi)
+        # Store through the typed ABI helper: this handles native, chunked,
+        # and scalar vector layouts without aliasing or integer reinterpretation.
+        return [
+            f"static inline {abi.base_ctype} {name}({abi.c_name} value, int lane) {{\n",
+            f"    {abi.base_ctype} values[{abi.lanes}];\n",
+            f"    {_abi_helper_name('store', abi)}(values, value);\n",
+            "    return values[lane];\n",
+            "}\n",
+        ]
     if op in {"add", "sub", "mul", "div"}:
         return _render_binary_helper(op, abi)
     if op == "sqrt":

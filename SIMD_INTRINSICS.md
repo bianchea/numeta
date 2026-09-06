@@ -80,13 +80,13 @@ lane3 = nm.extract_lane(i32, 3)
 ```
 
 The extraction lane must be a compile-time integer within the vector's lane
-range.
+range. `extract_lane` preserves the scalar element dtype, including floating values.
 
 ## Floor and exact powers of two
 
 ```python
 rounded = nm.floor(x)
-indices = nm.vcvt_f64_i32(rounded)
+indices = nm.astype(rounded, nm.i4)
 powers = nm.exp2_neg(indices)
 ```
 
@@ -111,4 +111,3 @@ def reciprocal_below_limit(out, inp, limit):
     result = nm.where(mask, refined, x)
     nm.vstore(out, 0, result)
 ```
-

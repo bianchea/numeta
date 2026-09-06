@@ -654,11 +654,13 @@ class CEmitter:
                 if helper_op is not None:
                     helper_dtype = (
                         self._dtype_from_expr(expr.args[0])
-                        if helper_op == "reduce_sum" and expr.args
+                        if helper_op in {"reduce_sum", "extract"} and expr.args
                         else dtype
                     )
                     if is_vector_dtype(helper_dtype):
                         self._register_simd_helper(helper_op, helper_dtype)
+                        if helper_op == "extract":
+                            self._register_simd_helper("store", helper_dtype)
                     if helper_op == "fma" and is_vector_dtype(dtype):
                         for arg in expr.args:
                             if not self._is_vector_expr(arg):
@@ -3204,11 +3206,13 @@ class CEmitter:
                 ]
                 return f"{helper}({', '.join(rendered_args)})"
             return f"(({args[0]}) * ({args[1]}) + ({args[2]}))"
-        if helper_op == "reduce_sum":
+        if helper_op in {"reduce_sum", "extract"}:
             if not expr.args:
                 return "0"
             vector_dtype = self._dtype_from_expr(expr.args[0])
             helper = simd_helper_name(helper_op, vector_dtype)
+            if helper_op == "extract":
+                return f"{helper}({args[0]}, {expr.metadata['lane']})"
             return f"{helper}({args[0]})"
         if helper_op is not None:
             vector_dtype = self._dtype_from_expr(expr)

@@ -13,6 +13,7 @@ class IRNode:
 @dataclass(frozen=True)
 class IRType:
     name: str
+    datatype: Any = None
     kind: str | None = None
     bitwidth: int | None = None
     struct: "IRStruct | None" = None

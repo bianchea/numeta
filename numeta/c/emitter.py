@@ -581,6 +581,8 @@ class CEmitter:
     def _dtype_from_expr(self, expr: IRExpr | None) -> DataType | None:
         if expr is None:
             return None
+        if expr.vtype is not None and expr.vtype.dtype.datatype is not None:
+            return expr.vtype.dtype.datatype
         source = getattr(expr, "source", None)
         dtype = getattr(source, "dtype", None)
         if dtype is not None:
@@ -1129,6 +1131,8 @@ class CEmitter:
         return names
 
     def _dtype_from_irvar(self, var: IRVar) -> DataType | None:
+        if var.vtype is not None and var.vtype.dtype.datatype is not None:
+            return var.vtype.dtype.datatype
         source: Any = var.source
         if source is None:
             return None
@@ -1366,6 +1370,10 @@ class CEmitter:
 
     def _render_statement(self, stmt: Any, indent: int) -> list[str]:
         if isinstance(stmt, IRAssign):
+            if isinstance(stmt.target, IRIntrinsic) and stmt.target.name in {"real", "aimag"}:
+                component = "__real__" if stmt.target.name == "real" else "__imag__"
+                target = f"{component}({self._render_expr(stmt.target.args[0])})"
+                return [f"{'    ' * indent}{target} = {self._render_expr(stmt.value)};\n"]
             if isinstance(stmt.target, IROpaqueExpr) and stmt.target.payload is not None:
                 payload = stmt.target.payload
                 payload_type = getattr(payload, "__class__", None)
@@ -2617,6 +2625,8 @@ class CEmitter:
                     expr, lambda value: self._render_expr_with_slice(value, loop_vars)
                 )
             op = _C_BINARY_OPS.get(expr.op, expr.op)
+            if getattr(self._dtype_from_expr(expr), "_name", "") == "bool8":
+                op = {"add": "||", "mul": "&&"}.get(expr.op, op)
             if op == "**":
                 return self._render_power(
                     expr.left,
@@ -2778,7 +2788,28 @@ class CEmitter:
         if expr is None:
             return ""
         if isinstance(expr, IRLiteral):
-            return self._render_literal(expr.value)
+            value = expr.value
+            dtype = self._dtype_from_expr(expr)
+            if getattr(dtype, "_name", "") == "bool8":
+                return "1" if bool(value) else "0"
+            if dtype is not None and getattr(dtype, "_name", "").startswith(("float", "complex")):
+                value = dtype.get_numpy()(value)
+                suffix = "L" if dtype._name in {"float128", "complex256"} else ""
+                if np.iscomplexobj(value):
+                    value = f"({value.real}{suffix} + {value.imag}{suffix}*I)"
+                else:
+                    value = self._render_literal(value) + suffix
+                if dtype._name in {"float64", "complex128"}:
+                    return value
+                return f"(({dtype.get_cnumpy()})({value}))"
+            if (
+                getattr(dtype, "_name", "").startswith("int")
+                or getattr(dtype, "_name", "") == "size_t"
+            ):
+                value = int(value.real if np.iscomplexobj(value) else value)
+            if isinstance(value, np.bool_):
+                return "1" if value else "0"
+            return self._render_literal(value)
         if isinstance(expr, IRVarRef):
             if expr.var is None:
                 return ""
@@ -2795,6 +2826,8 @@ class CEmitter:
             if expr.op in {"floordiv", "mod", "truncdiv", "truncmod"}:
                 return self._render_divmod(expr, self._render_expr)
             op = _C_BINARY_OPS.get(expr.op, expr.op)
+            if getattr(self._dtype_from_expr(expr), "_name", "") == "bool8":
+                op = {"add": "||", "mul": "&&"}.get(expr.op, op)
             if op == "**":
                 return self._render_power(expr.left, expr.right, self._render_expr)
             return f"({self._render_expr(expr.left)} {op} {self._render_expr(expr.right)})"
@@ -3110,27 +3143,22 @@ class CEmitter:
         return lines
 
     def _is_complex_expr(self, expr: IRExpr) -> bool:
-        if isinstance(expr, IRVarRef) and expr.var is not None:
-            dtype = self._dtype_from_irvar(expr.var)
-            if dtype is not None:
-                return dtype.get_numpy() in (np.complex64, np.complex128, NP_COMPLEX256)
-        if expr.vtype is not None and expr.vtype.dtype is not None:
-            return expr.vtype.dtype.name == "complex"
-        return False
+        dtype = self._dtype_from_expr(expr)
+        return getattr(dtype, "_name", "").startswith("complex")
 
     def _is_longdouble_complex_expr(self, expr: IRExpr) -> bool:
-        if isinstance(expr, IRVarRef) and expr.var is not None:
-            dtype = self._dtype_from_irvar(expr.var)
-            if dtype is not None:
-                return dtype.get_numpy() == NP_COMPLEX256
-        return False
+        dtype = self._dtype_from_expr(expr)
+        return getattr(dtype, "_name", "") == "complex256"
 
     def _is_integer_expr(self, expr: IRExpr) -> bool:
+        if expr.vtype is not None and expr.vtype.dtype.datatype is not None:
+            name = expr.vtype.dtype.datatype._name
+            return name == "size_t" or name.startswith(("int", "uint"))
         if isinstance(expr, IRLiteral) and isinstance(expr.value, int):
             return True
         if isinstance(expr, IRGetItem) and expr.base is not None:
             return self._is_integer_expr(expr.base)
-        source_dtype = getattr(getattr(expr, "source", None), "dtype", None)
+        source_dtype = expr.vtype.dtype.datatype if expr.vtype else None
         source_name = getattr(source_dtype, "_name", "")
         if source_name == "size_t" or source_name.startswith(("int", "uint")):
             return True
@@ -3244,6 +3272,8 @@ class CEmitter:
             return f"(nearbyint(({args[0]}) * {scale}) / {scale})"
         if name == "astype":
             dtype = self._dtype_from_expr(expr)
+            if dtype._name == "bool8":
+                return f"(({args[0]}) != 0)"
             ctype = dtype.get_cnumpy()
             return f"(({ctype})({args[0]}))"
         if name == "select":
@@ -3463,6 +3493,8 @@ class CEmitter:
         return f"pow({renderer(left)}, {renderer(right)})"
 
     def _map_irvar_to_ctype(self, var: IRVar) -> str:
+        if var.vtype is not None and var.vtype.dtype.datatype is not None:
+            return var.vtype.dtype.datatype.get_cnumpy()
         source: Any = var.source
         if source is not None:
             dtype = getattr(source, "dtype", None)

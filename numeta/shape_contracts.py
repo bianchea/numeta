@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .ir.lowering import lower_procedure
-from .ir.nodes import IRAssign, IRBinary, IRGetItem, IRIf, IRLiteral, IRUnary, IRVarRef
+from .ir.nodes import IRAssign, IRBinary, IRGetItem, IRIf, IRIntrinsic, IRLiteral, IRUnary, IRVarRef
 from .wrapper_spec import ShapeEquality
 
 
@@ -30,6 +30,11 @@ def infer_shape_equalities(symbolic_function, argument_specs) -> tuple[ShapeEqua
             if left is None or right is None:
                 return None
             return left | right
+        if isinstance(expression, IRIntrinsic) and expression.name in {"astype", "select"}:
+            sources = [elementwise_sources(argument) for argument in expression.args]
+            if any(source is None for source in sources):
+                return None
+            return set().union(*sources)
         if isinstance(expression, IRUnary):
             return elementwise_sources(expression.operand)
         if isinstance(expression, IRGetItem):

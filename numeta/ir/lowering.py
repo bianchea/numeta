@@ -90,22 +90,23 @@ _BINARY_OPS: dict[str, str] = {
 }
 
 
-def _lower_value_type_from_dtype(dtype, shape) -> IRValueType:
+def _lower_value_type_from_dtype(dtype, shape, lower_expr) -> IRValueType:
     # Used for C backend to avoid FortranType dependency
     if getattr(dtype, "_is_vector", False):
         base_dtype = dtype.base_dtype()
-        base_type = IRType(name=getattr(base_dtype, "_name", str(base_dtype)), kind=None)
+        base_type = IRType(name=base_dtype._name, kind=None, datatype=base_dtype)
         ir_type = IRType(
-            name=dtype.name,
+            name=dtype._name,
+            datatype=dtype,
             kind=None,
             bitwidth=dtype.get_nbytes() * 8,
             is_vector=True,
             vector_lanes=dtype.lanes(),
             vector_base=base_type,
         )
-        return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax))
-    ir_type = IRType(name=dtype.name, kind=None)
-    return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax))
+        return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax, lower_expr))
+    ir_type = IRType(name=dtype._name, kind=None, datatype=dtype)
+    return IRValueType(dtype=ir_type, shape=_lower_ir_shape(shape, settings.syntax, lower_expr))
 
 
 def _is_scalar_shape(shape) -> bool:
@@ -116,78 +117,120 @@ def _is_unknown_rank_shape(shape) -> bool:
     return isinstance(shape, ArrayShape) and shape.is_unknown
 
 
-def _lower_ir_shape(shape, syntax_settings) -> IRShape | None:
+def _lower_ir_shape(shape, syntax_settings, lower_expr) -> IRShape | None:
     if _is_scalar_shape(shape):
         return None
     if _is_unknown_rank_shape(shape):
         return IRShape(rank=None, dims=None, order="C")
-    dims = _lower_shape_dims(shape.as_tuple(), syntax_settings)
+    dims = _lower_shape_dims(shape.as_tuple(), syntax_settings, lower_expr)
     order = "F" if getattr(shape, "fortran_order", False) else "C"
     return IRShape(rank=len(dims), dims=dims, order=order)
 
 
 def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedure:
-    syntax_settings = settings.syntax
-    iso_c_mode = settings.iso_C
-    backend_is_c = backend == "c"
-    arg_names = set(procedure.arguments)
-    var_cache: dict[int, IRVar] = {}
-    vtype_by_dtype_shape: dict[tuple[int, int], IRValueType] = {}
-    vtype_by_ftype_shape: dict[tuple[int, int], IRValueType] = {}
-    ftype_cache: dict[int, Any] = {}
-    ir_type_cache: dict[int, IRType] = {}
+    from .validation import validate_numeric_ir
 
-    literal_type = LiteralNode
-    variable_type = Variable
-    binary_type = BinaryOperationNode
-    function_call_type = FunctionCall
-    getitem_type = GetItem
-    whole_storage_type = WholeStorage
-    getattr_type = GetAttr
-    array_constructor_type = ArrayConstructor
-    intrinsic_type = IntrinsicFunction
+    result = LoweringContext(procedure, backend).lower()
+    validate_numeric_ir(result)
+    return result
 
-    def _get_vtype(expr, shape=None):
+
+class LoweringContext:
+    """Own one procedure's recursive value, index and type conversion."""
+
+    def __init__(self, procedure, backend):
+        self.procedure = procedure
+        self.backend = backend
+
+    def lower(self):
+        procedure = self.procedure
+        self.syntax_settings = settings.syntax
+        self.iso_c_mode = settings.iso_C
+        self.backend_is_c = self.backend == "c"
+        self.arg_names = set(self.procedure.arguments)
+        self.var_cache: dict[int, IRVar] = {}
+        self.vtype_by_dtype_shape: dict[tuple[int, int], IRValueType] = {}
+        self.vtype_by_ftype_shape: dict[tuple[int, int], IRValueType] = {}
+        self.ftype_cache: dict[int, Any] = {}
+        self.ir_type_cache: dict[int, IRType] = {}
+
+        args = [self.lower_var(var, is_arg=True) for var in procedure.arguments.values()]
+        locals_ = [
+            self.lower_var(var, is_arg=False) for var in procedure.get_local_variables().values()
+        ]
+        body = [self.lower_stmt(stmt) for stmt in procedure.scope.get_statements()]
+
+        decl = procedure.get_declaration()
+        scope_ids = {id(stmt) for stmt in procedure.scope.get_statements()}
+        prelude_items: list[Any] = []
+        for stmt in decl.get_statements():
+            if id(stmt) in scope_ids:
+                continue
+            if isinstance(stmt, VariableDeclaration):
+                continue
+            prelude_items.append(stmt)
+
+        return IRProcedure(
+            name=procedure.name,
+            args=args,
+            locals=locals_,
+            body=body,
+            result=None,
+            source=procedure,
+            metadata={
+                "syntax_procedure": procedure,
+                "fortran_prelude_items": prelude_items,
+                "fortran_pure": procedure.pure,
+                "fortran_elemental": procedure.elemental,
+                "fortran_bind_c": procedure.bind_c,
+                "c_attributes": tuple(getattr(procedure, "c_attributes", ())),
+                "c_linkage": getattr(procedure, "c_linkage", None),
+                "emit_mode": getattr(procedure, "emit_mode", None),
+            },
+        )
+
+    def _get_vtype(self, expr, shape=None, dtype=None):
         if shape is None:
             shape = _safe_shape(expr)
-        dtype = getattr(expr, "dtype", None)
+        if dtype is None:
+            dtype = getattr(expr, "dtype", None)
         if dtype is None:
             raise_with_source(
                 ValueError,
-                f"Cannot determine dtype for expression: {expr}",
+                "Cannot determine expression dtype. Use a supported numeric value.",
                 source_node=expr,
             )
         dtype_shape_key = (id(dtype), id(shape))
-        lowered = vtype_by_dtype_shape.get(dtype_shape_key)
+        lowered = self.vtype_by_dtype_shape.get(dtype_shape_key)
         if lowered is None:
-            if backend_is_c:
-                lowered = _lower_value_type_from_dtype(dtype, shape)
+            if self.backend_is_c:
+                lowered = _lower_value_type_from_dtype(dtype, shape, self.lower_expr)
             else:
                 dtype_key = id(dtype)
-                ftype = ftype_cache.get(dtype_key)
+                ftype = self.ftype_cache.get(dtype_key)
                 if ftype is None:
-                    ftype = cast(Any, dtype).get_fortran(bind_c=iso_c_mode)
-                    ftype_cache[dtype_key] = ftype
-                ftype_shape_key = (id(ftype), id(shape))
-                lowered = vtype_by_ftype_shape.get(ftype_shape_key)
+                    ftype = cast(Any, dtype).get_fortran(bind_c=self.iso_c_mode)
+                    self.ftype_cache[dtype_key] = ftype
+                ftype_shape_key = (id(dtype), id(shape))
+                lowered = self.vtype_by_ftype_shape.get(ftype_shape_key)
                 if lowered is None:
-                    ftype_id = id(ftype)
-                    lowered_type = ir_type_cache.get(ftype_id)
+                    ftype_id = id(dtype)
+                    lowered_type = self.ir_type_cache.get(ftype_id)
                     if lowered_type is None:
-                        lowered_type = _lower_type(ftype)
-                        ir_type_cache[ftype_id] = lowered_type
+                        lowered_type = _lower_type(ftype, dtype)
+                        self.ir_type_cache[ftype_id] = lowered_type
                     lowered = IRValueType(
                         dtype=lowered_type,
-                        shape=_lower_ir_shape(shape, syntax_settings),
+                        shape=_lower_ir_shape(shape, self.syntax_settings, self.lower_expr),
                     )
-                    vtype_by_ftype_shape[ftype_shape_key] = lowered
-            vtype_by_dtype_shape[dtype_shape_key] = lowered
+                    self.vtype_by_ftype_shape[ftype_shape_key] = lowered
+            self.vtype_by_dtype_shape[dtype_shape_key] = lowered
         return lowered
 
-    def lower_var(var: Variable, *, is_arg: bool) -> IRVar:
+    def lower_var(self, var: Variable, *, is_arg: bool) -> IRVar:
         key = id(var)
-        if key in var_cache:
-            return var_cache[key]
+        if key in self.var_cache:
+            return self.var_cache[key]
         var_dtype = var.dtype
         if var_dtype is None:
             raise_with_source(
@@ -195,32 +238,7 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                 f"Variable {var.name} has no dtype",
                 source_node=var,
             )
-        shape = var._shape
-        dtype_shape_key = (id(var_dtype), id(shape))
-        vtype = vtype_by_dtype_shape.get(dtype_shape_key)
-        if vtype is None:
-            if backend_is_c:
-                vtype = _lower_value_type_from_dtype(var_dtype, shape)
-            else:
-                dtype_key = id(var_dtype)
-                ftype = ftype_cache.get(dtype_key)
-                if ftype is None:
-                    ftype = cast(Any, var_dtype).get_fortran(bind_c=iso_c_mode)
-                    ftype_cache[dtype_key] = ftype
-                ftype_shape_key = (id(ftype), id(shape))
-                vtype = vtype_by_ftype_shape.get(ftype_shape_key)
-                if vtype is None:
-                    ftype_id = id(ftype)
-                    lowered_type = ir_type_cache.get(ftype_id)
-                    if lowered_type is None:
-                        lowered_type = _lower_type(ftype)
-                        ir_type_cache[ftype_id] = lowered_type
-                    vtype = IRValueType(
-                        dtype=lowered_type,
-                        shape=_lower_ir_shape(shape, syntax_settings),
-                    )
-                    vtype_by_ftype_shape[ftype_shape_key] = vtype
-            vtype_by_dtype_shape[dtype_shape_key] = vtype
+        vtype = self._get_vtype(var)
         storage = "value"
         if getattr(var, "allocatable", False):
             storage = "allocatable"
@@ -243,72 +261,88 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             pass_by_value=var.pass_by_value,
             source=var,
         )
-        var_cache[key] = ir_var
+        self.var_cache[key] = ir_var
         return ir_var
 
-    def lower_expr(expr) -> IRExpr:
+    def lower_expr(self, expr) -> IRExpr:
         if isinstance(expr, IRExpr):
             return expr
+        from numeta.ast.tools import check_node
+
+        expr = check_node(expr)
         expr_type = type(expr)
-        if expr_type is Procedure or expr_type is Function:
-            return IRVarRef(var=IRVar(name=expr.name, source=expr), source=expr)
-        if expr_type is literal_type:
+        if isinstance(expr, (Procedure, Function)):
+            return IRVarRef(
+                var=IRVar(name=expr.name, source=expr),
+                source=expr,
+                metadata={"procedure_reference": True},
+            )
+        if expr_type is LiteralNode:
             return IRLiteral(
                 value=expr.value,
-                vtype=_get_vtype(expr),
+                vtype=self._get_vtype(expr),
                 source=expr,
             )
-        if expr_type is variable_type:
-            ir_var = lower_var(expr, is_arg=expr.name in arg_names)
+        if expr_type is Variable:
+            ir_var = self.lower_var(expr, is_arg=expr.name in self.arg_names)
             return IRVarRef(
                 var=ir_var,
                 vtype=ir_var.vtype,
                 source=expr,
             )
-        if expr_type is whole_storage_type:
-            return lower_expr(expr.variable)
-        if expr_type is binary_type or isinstance(expr, binary_type):
+        if expr_type is WholeStorage:
+            return self.lower_expr(expr.variable)
+        if expr_type is BinaryOperationNode or isinstance(expr, BinaryOperationNode):
             op = _map_binary_op(expr.op)
             return IRBinary(
                 op=op,
-                left=lower_expr(expr.left),
-                right=lower_expr(expr.right),
-                vtype=_get_vtype(expr),
+                left=self.lower_expr(expr.left),
+                right=self.lower_expr(expr.right),
+                vtype=self._get_vtype(expr),
                 source=expr,
             )
-        if expr_type is function_call_type:
+        if expr_type is FunctionCall:
             return IRCallExpr(
-                callee=lower_expr(expr.function),
-                args=[lower_expr(arg) for arg in expr.arguments],
-                vtype=_get_vtype(expr),
+                callee=self.lower_expr(expr.function),
+                args=[self.lower_expr(arg) for arg in expr.arguments],
+                vtype=self._get_vtype(expr),
                 source=expr,
             )
-        if expr_type is getitem_type:
-            indices = _lower_indices(expr.sliced, syntax_settings)
+        if expr_type is GetItem:
+            indices = _lower_indices(expr.sliced, self.syntax_settings, self.lower_expr)
             shape = _safe_shape(expr)
-            return IRGetItem(
-                base=lower_expr(expr.variable),
-                indices=indices,
-                vtype=_get_vtype(expr, shape),
-                source=expr,
-            )
-        if expr_type is getattr_type:
+            base = self.lower_expr(expr.variable)
+            vtype = self._get_vtype(expr, shape)
+
+            def indexed(value):
+                indexed_type = IRValueType(dtype=value.vtype.dtype, shape=vtype.shape)
+                if isinstance(value, IRIntrinsic) and value.name == "astype":
+                    return IRIntrinsic(
+                        name="astype",
+                        args=[indexed(value.args[0])],
+                        vtype=indexed_type,
+                        source=expr,
+                    )
+                return IRGetItem(base=value, indices=indices, vtype=indexed_type, source=expr)
+
+            return indexed(base)
+        if expr_type is GetAttr:
             return IRGetAttr(
-                base=lower_expr(expr.variable),
+                base=self.lower_expr(expr.variable),
                 name=expr.attr,
-                vtype=_get_vtype(expr),
+                vtype=self._get_vtype(expr),
                 source=expr,
             )
-        if expr_type is array_constructor_type:
+        if expr_type is ArrayConstructor:
             return IRIntrinsic(
                 name="array_constructor",
-                args=[lower_expr(arg) for arg in expr.elements],
-                vtype=_get_vtype(expr),
+                args=[self.lower_expr(arg) for arg in expr.elements],
+                vtype=self._get_vtype(expr),
                 source=expr,
             )
-        if expr_type is intrinsic_type or isinstance(expr, intrinsic_type):
+        if expr_type is IntrinsicFunction or isinstance(expr, IntrinsicFunction):
             token = getattr(expr, "token", "")
-            args = [lower_expr(arg) for arg in expr.arguments]
+            args = [self.lower_expr(arg) for arg in expr.arguments]
             if (
                 token == "round_even"
                 and getattr(expr.arguments[0].dtype, "_name", "").startswith("int")
@@ -317,20 +351,20 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                 # Already-integral values must not lose precision through a real
                 # intermediate, especially above the exact float64 integer range.
                 return IRIntrinsic(
-                    name="astype", args=args[:1], vtype=_get_vtype(expr), source=expr
+                    name="astype", args=args[:1], vtype=self._get_vtype(expr), source=expr
                 )
             if token == "-" and len(args) == 1:
                 return IRUnary(
                     op="neg",
                     operand=args[0],
-                    vtype=_get_vtype(expr),
+                    vtype=self._get_vtype(expr),
                     source=expr,
                 )
             if token == ".not." and len(args) == 1:
                 return IRUnary(
                     op="not",
                     operand=args[0],
-                    vtype=_get_vtype(expr),
+                    vtype=self._get_vtype(expr),
                     source=expr,
                 )
             metadata = {}
@@ -343,43 +377,52 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             return IRIntrinsic(
                 name=token,
                 args=args,
-                vtype=_get_vtype(expr),
+                vtype=self._get_vtype(expr),
                 source=expr,
                 metadata=metadata,
             )
+        from numeta.ast.expressions.various import Re, Im
+
+        if isinstance(expr, (Re, Im)):
+            return IRIntrinsic(
+                name="real" if isinstance(expr, Re) else "aimag",
+                args=[self.lower_expr(expr.variable)],
+                vtype=self._get_vtype(expr),
+                source=expr,
+            )
         return IROpaqueExpr(payload=expr, source=expr)
 
-    def lower_stmt(stmt) -> IRNode:
+    def lower_stmt(self, stmt) -> IRNode:
         if isinstance(stmt, Assignment):
             return IRAssign(
-                target=lower_expr(stmt.target),
-                value=lower_expr(stmt.value),
+                target=self.lower_expr(stmt.target),
+                value=self.lower_expr(stmt.value),
                 source=stmt,
             )
         if isinstance(stmt, Call):
             return IRCall(
-                func=lower_expr(stmt.function),
-                args=[lower_expr(arg) for arg in stmt.arguments],
+                func=self.lower_expr(stmt.function),
+                args=[self.lower_expr(arg) for arg in stmt.arguments],
                 source=stmt,
             )
         if isinstance(stmt, If):
-            then_body = [lower_stmt(s) for s in stmt.scope.get_statements()]
+            then_body = [self.lower_stmt(s) for s in stmt.scope.get_statements()]
             else_body: list[IRNode] = []
             for branch in stmt.orelse:
                 if isinstance(branch, ElseIf):
                     nested = IRIf(
-                        cond=lower_expr(branch.condition),
-                        then=[lower_stmt(s) for s in branch.scope.get_statements()],
+                        cond=self.lower_expr(branch.condition),
+                        then=[self.lower_stmt(s) for s in branch.scope.get_statements()],
                         else_=[],
                         source=branch,
                     )
                     else_body.append(nested)
                 elif isinstance(branch, Else):
-                    else_body.extend([lower_stmt(s) for s in branch.scope.get_statements()])
+                    else_body.extend([self.lower_stmt(s) for s in branch.scope.get_statements()])
                 else:
-                    else_body.append(lower_stmt(branch))
+                    else_body.append(self.lower_stmt(branch))
             return IRIf(
-                cond=lower_expr(stmt.condition),
+                cond=self.lower_expr(stmt.condition),
                 then=then_body,
                 else_=else_body,
                 source=stmt,
@@ -387,15 +430,15 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
         if isinstance(stmt, For):
             iterator = stmt.iterator
             if isinstance(iterator, Variable):
-                loop_var = lower_var(iterator, is_arg=False)
+                loop_var = self.lower_var(iterator, is_arg=False)
             else:
                 loop_var = IRVar(name=str(iterator), source=iterator)
             return IRFor(
                 var=loop_var,
-                start=lower_expr(stmt.start),
-                stop=lower_expr(stmt.end),
-                step=lower_expr(stmt.step) if stmt.step is not None else None,
-                body=[lower_stmt(s) for s in stmt.scope.get_statements()],
+                start=self.lower_expr(stmt.start),
+                stop=self.lower_expr(stmt.end),
+                step=self.lower_expr(stmt.step) if stmt.step is not None else None,
+                body=[self.lower_stmt(s) for s in stmt.scope.get_statements()],
                 source=stmt,
                 metadata=(
                     {
@@ -412,8 +455,8 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
             )
         if isinstance(stmt, While):
             return IRWhile(
-                cond=lower_expr(stmt.condition),
-                body=[lower_stmt(s) for s in stmt.scope.get_statements()],
+                cond=self.lower_expr(stmt.condition),
+                body=[self.lower_stmt(s) for s in stmt.scope.get_statements()],
                 source=stmt,
             )
         if isinstance(stmt, Switch):
@@ -422,14 +465,12 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
                 return IROpaqueStmt(payload=stmt, source=stmt)
 
             def build_case(case_stmt):
-                cond = IRBinary(
-                    op="eq",
-                    left=lower_expr(stmt.value),
-                    right=lower_expr(case_stmt.value),
-                )
+                comparison = BinaryOperationNode(stmt.value, ".eq.", case_stmt.value)
+                comparison._source_location = getattr(case_stmt, "source_location", None)
+                cond = self.lower_expr(comparison)
                 return IRIf(
                     cond=cond,
-                    then=[lower_stmt(s) for s in case_stmt.scope.get_statements()],
+                    then=[self.lower_stmt(s) for s in case_stmt.scope.get_statements()],
                     else_=[],
                     source=case_stmt,
                 )
@@ -444,185 +485,81 @@ def lower_procedure(procedure: Procedure, backend: str = "fortran") -> IRProcedu
         if isinstance(stmt, Return):
             return IRReturn(value=None, source=stmt)
         if isinstance(stmt, Print):
-            return IRPrint(values=[lower_expr(value) for value in stmt.to_print], source=stmt)
+            return IRPrint(values=[self.lower_expr(value) for value in stmt.to_print], source=stmt)
         if isinstance(stmt, Allocate):
             return IRAllocate(
-                var=lower_expr(stmt.target),
-                dims=[lower_expr(dim) for dim in stmt.shape],
+                var=self.lower_expr(stmt.target),
+                dims=[self.lower_expr(dim) for dim in stmt.shape],
                 source=stmt,
             )
         if isinstance(stmt, Deallocate):
-            return IRDeallocate(var=lower_expr(stmt.array), source=stmt)
+            return IRDeallocate(var=self.lower_expr(stmt.array), source=stmt)
         if stmt.__class__.__name__ == "VStore":
             return IRSimdStore(
-                array=lower_expr(stmt.array),
-                index=lower_expr(stmt.index),
-                value=lower_expr(stmt.value),
+                array=self.lower_expr(stmt.array),
+                index=self.lower_expr(stmt.index),
+                value=self.lower_expr(stmt.value),
                 aligned=bool(getattr(stmt, "aligned", False)),
                 source=stmt,
             )
         return IROpaqueStmt(payload=stmt, source=stmt)
 
-    args = [lower_var(var, is_arg=True) for var in procedure.arguments.values()]
-    locals_ = [lower_var(var, is_arg=False) for var in procedure.get_local_variables().values()]
-    body = [lower_stmt(stmt) for stmt in procedure.scope.get_statements()]
 
-    decl = procedure.get_declaration()
-    scope_ids = {id(stmt) for stmt in procedure.scope.get_statements()}
-    prelude_items: list[Any] = []
-    for stmt in decl.get_statements():
-        if id(stmt) in scope_ids:
-            continue
-        if isinstance(stmt, VariableDeclaration):
-            continue
-        prelude_items.append(stmt)
-
-    return IRProcedure(
-        name=procedure.name,
-        args=args,
-        locals=locals_,
-        body=body,
-        result=None,
-        source=procedure,
-        metadata={
-            "syntax_procedure": procedure,
-            "fortran_prelude_items": prelude_items,
-            "fortran_pure": procedure.pure,
-            "fortran_elemental": procedure.elemental,
-            "fortran_bind_c": procedure.bind_c,
-            "c_attributes": tuple(getattr(procedure, "c_attributes", ())),
-            "c_linkage": getattr(procedure, "c_linkage", None),
-            "emit_mode": getattr(procedure, "emit_mode", None),
-        },
-    )
-
-
-def _lower_value_type(ftype, shape) -> IRValueType:
-    dtype = _lower_type(ftype)
-    return IRValueType(dtype=dtype, shape=_lower_ir_shape(shape, settings.syntax))
-
-
-def _lower_shape_dims(dims, syntax_settings) -> tuple:
+def _lower_shape_dims(dims, syntax_settings, lower_expr) -> tuple:
     lowered = []
     for dim in dims:
         if isinstance(dim, int):
             lowered.append(dim)
             continue
-        lowered_dim = _lower_index_value(dim, syntax_settings)
+        lowered_dim = lower_expr(dim) if dim is not None else None
         lowered.append(lowered_dim if lowered_dim is not None else dim)
     return tuple(lowered)
 
 
-def _lower_type(ftype) -> IRType:
+def _lower_type(ftype, dtype) -> IRType:
     name = getattr(ftype, "type", str(ftype))
     kind = None
     if hasattr(ftype, "get_kind_str"):
         kind = ftype.get_kind_str()
-    return IRType(name=name, kind=kind)
+    return IRType(name=name, kind=kind, datatype=dtype)
 
 
 def _safe_shape(expr):
     return expr._shape
 
 
-def _lower_indices(slice_, syntax_settings) -> list[IRExpr | IRSlice]:
+def _lower_indices(slice_, syntax_settings, lower_expr) -> list[IRExpr | IRSlice]:
     if isinstance(slice_, tuple):
-        return [_lower_single_index(item, syntax_settings) for item in slice_]
-    return [_lower_single_index(slice_, syntax_settings)]
+        return [_lower_single_index(item, syntax_settings, lower_expr) for item in slice_]
+    return [_lower_single_index(slice_, syntax_settings, lower_expr)]
 
 
-def _lower_single_index(item, syntax_settings) -> IRExpr | IRSlice:
+def _lower_single_index(item, syntax_settings, lower_expr) -> IRExpr | IRSlice:
     if isinstance(item, slice):
-        return _normalize_slice(item, syntax_settings)
-    expr = _lower_index_value(item, syntax_settings) or IROpaqueExpr(payload=item, source=item)
+        return _normalize_slice(item, syntax_settings, lower_expr)
+    expr = lower_expr(item)
     return _shift_expr(expr, -syntax_settings.array_lower_bound)
 
 
-def _lower_index_value(value, syntax_settings) -> IRExpr | None:
-    if value is None:
-        return None
-    value_type = type(value)
-    if value_type is int or value_type is float or value_type is bool or value_type is str:
-        return IRLiteral(value=value)
-    if value_type is LiteralNode:
-        return IRLiteral(value=value.value)
-    if value_type is Variable:
-        return IRVarRef(var=IRVar(name=value.name, source=value), source=value)
-    if value_type is WholeStorage:
-        return _lower_index_value(value.variable, syntax_settings)
-    if value_type is BinaryOperationNode or isinstance(value, BinaryOperationNode):
-        op = _map_binary_op(value.op)
-        left = _lower_index_value(value.left, syntax_settings) or IROpaqueExpr(
-            payload=value.left, source=value.left
-        )
-        right = _lower_index_value(value.right, syntax_settings) or IROpaqueExpr(
-            payload=value.right, source=value.right
-        )
-        return IRBinary(op=op, left=left, right=right)
-    if value_type is GetItem:
-        base = _lower_index_value(value.variable, syntax_settings) or IROpaqueExpr(
-            payload=value.variable, source=value.variable
-        )
-        return IRGetItem(base=base, indices=_lower_indices(value.sliced, syntax_settings))
-    if value_type is GetAttr:
-        base = _lower_index_value(value.variable, syntax_settings) or IROpaqueExpr(
-            payload=value.variable, source=value.variable
-        )
-        return IRGetAttr(base=base, name=value.attr)
-    if value_type is FunctionCall:
-        callee = _lower_index_value(value.function, syntax_settings) or IROpaqueExpr(
-            payload=value.function, source=value.function
-        )
-        args = []
-        for argument in value.arguments:
-            lowered_arg = _lower_index_value(argument, syntax_settings)
-            if lowered_arg is not None:
-                args.append(lowered_arg)
-        return IRCallExpr(
-            callee=callee,
-            args=args,
-        )
-    if value_type is IntrinsicFunction or isinstance(value, IntrinsicFunction):
-        args = []
-        for argument in value.arguments:
-            lowered_arg = _lower_index_value(argument, syntax_settings)
-            if lowered_arg is not None:
-                args.append(lowered_arg)
-        token = getattr(value, "token", "")
-        metadata = {}
-        if token == "simd_compare":
-            metadata["predicate"] = value.predicate
-        elif token == "simd_extract_i32":
-            metadata["lane"] = value.lane
-        return IRIntrinsic(name=token, args=args, metadata=metadata)
-    return IROpaqueExpr(payload=value, source=value)
-
-
-def _normalize_slice(slice_: slice, syntax_settings) -> IRSlice:
+def _normalize_slice(slice_: slice, syntax_settings, lower_expr) -> IRSlice:
     lbound = syntax_settings.array_lower_bound
     c_like = syntax_settings.c_like_bounds
 
     if slice_.start is None:
-        start = IRLiteral(value=0)
+        start = lower_expr(0)
     else:
-        start = _lower_index_value(slice_.start, syntax_settings) or IROpaqueExpr(
-            payload=slice_.start, source=slice_.start
-        )
+        start = lower_expr(slice_.start)
         start = _shift_expr(start, -lbound)
 
     stop = None
     if slice_.stop is not None:
-        stop_expr = _lower_index_value(slice_.stop, syntax_settings) or IROpaqueExpr(
-            payload=slice_.stop, source=slice_.stop
-        )
+        stop_expr = lower_expr(slice_.stop)
         shift = (0 if c_like else 1) - lbound
         stop = _shift_expr(stop_expr, shift)
 
     step = None
     if slice_.step is not None:
-        step = _lower_index_value(slice_.step, syntax_settings) or IROpaqueExpr(
-            payload=slice_.step, source=slice_.step
-        )
+        step = lower_expr(slice_.step)
 
     return IRSlice(start=start, stop=stop, step=step)
 
@@ -631,9 +568,15 @@ def _shift_expr(expr: IRExpr, delta: int) -> IRExpr:
     if delta == 0:
         return expr
     if isinstance(expr, IRLiteral) and isinstance(expr.value, (int, float)):
-        return IRLiteral(value=expr.value + delta)
+        return IRLiteral(value=expr.value + delta, vtype=expr.vtype, source=expr.source)
     op = "add" if delta > 0 else "sub"
-    return IRBinary(op=op, left=expr, right=IRLiteral(value=abs(delta)))
+    return IRBinary(
+        op=op,
+        left=expr,
+        right=IRLiteral(value=abs(delta), vtype=expr.vtype),
+        vtype=expr.vtype,
+        source=expr.source,
+    )
 
 
 def _map_binary_op(op: str) -> str:

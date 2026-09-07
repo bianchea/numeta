@@ -99,6 +99,30 @@ class FortranEmitter:
         lines: list[str] = []
         lines.append(print_block(start_blocks, indent=0))
 
+        # Promotion may introduce kinds absent from the original AST declarations.
+        from dataclasses import fields, is_dataclass
+
+        kinds = set()
+        seen = set()
+
+        def collect_kinds(node):
+            if not is_dataclass(node) or isinstance(node, type) or id(node) in seen:
+                return
+            seen.add(id(node))
+            kind = getattr(node, "kind", None)
+            if isinstance(kind, str) and kind.startswith("c_"):
+                kinds.add(kind)
+            for field in fields(node):
+                if field.name in {"source", "metadata", "datatype"}:
+                    continue
+                value = getattr(node, field.name)
+                for child in value if isinstance(value, (list, tuple)) else (value,):
+                    collect_kinds(child)
+
+        collect_kinds(proc)
+        for kind in sorted(kinds):
+            lines.append(print_block(["use iso_c_binding, only: ", kind], indent=1))
+
         prelude_lines = proc.metadata.get("fortran_prelude_lines", [])
         prelude_items = proc.metadata.get("fortran_prelude_items", [])
         if prelude_lines:
@@ -129,7 +153,12 @@ class FortranEmitter:
                 if target_shape is not None and target_shape.rank == 2
                 else self._expr_blocks(stmt.value)
             )
-            blocks = self._expr_blocks(stmt.target) + ["="] + value
+            if isinstance(stmt.target, IRIntrinsic) and stmt.target.name in {"real", "aimag"}:
+                component = "%re" if stmt.target.name == "real" else "%im"
+                target = self._expr_blocks(stmt.target.args[0]) + [component]
+            else:
+                target = self._expr_blocks(stmt.target)
+            blocks = target + ["="] + value
             return [print_block(blocks, indent=indent)]
         if stmt_type is IRCall:
             blocks = ["call", " "] + self._expr_blocks(stmt.func) + ["("]
@@ -229,11 +258,14 @@ class FortranEmitter:
         return [print_block(["! unsupported statement"], indent=indent)]
 
     def _is_integer_expr(self, expr: IRExpr) -> bool:
+        if expr.vtype is not None and expr.vtype.dtype.datatype is not None:
+            name = expr.vtype.dtype.datatype._name
+            return name == "size_t" or name.startswith(("int", "uint"))
         if isinstance(expr, IRLiteral) and isinstance(expr.value, int):
             return True
         if isinstance(expr, IRGetItem) and expr.base is not None:
             return self._is_integer_expr(expr.base)
-        source_dtype = getattr(getattr(expr, "source", None), "dtype", None)
+        source_dtype = expr.vtype.dtype.datatype if expr.vtype else None
         source_name = getattr(source_dtype, "_name", "")
         if source_name == "size_t" or source_name.startswith(("int", "uint")):
             return True
@@ -260,9 +292,8 @@ class FortranEmitter:
             return [""]
         expr_type = type(expr)
         if expr_type is IRLiteral:
-            source: Any = expr.source
-            if source is not None:
-                return render_expr_blocks(source)
+            if expr.vtype and expr.vtype.dtype.datatype is not None:
+                return render_literal_blocks_from_dtype(expr.value, expr.vtype.dtype.datatype)
             if isinstance(expr.value, str):
                 return [f'"{expr.value}"']
             if isinstance(expr.value, bool):
@@ -276,6 +307,15 @@ class FortranEmitter:
         if expr_type is IRBinary:
             left = self._expr_blocks(expr.left)
             right = self._expr_blocks(expr.right)
+            if expr.left.vtype and expr.left.vtype.dtype.name == "logical":
+                logical_op = {"eq": ".eqv.", "ne": ".neqv.", "add": ".or.", "mul": ".and."}.get(
+                    expr.op
+                )
+                if logical_op:
+                    return ["(", *left, logical_op, *right, ")"]
+                if expr.op in {"lt", "le", "gt", "ge"}:
+                    left = ["merge(1,0,", *left, ")"]
+                    right = ["merge(1,0,", *right, ")"]
             if expr.op == "shl":
                 return ["ishft(", *left, ",", *right, ")"]
             if expr.op == "shr":
@@ -434,6 +474,13 @@ class FortranEmitter:
 
             if expr.name == "astype":
                 dtype = expr.vtype.dtype
+                argument = expr.args[0]
+                source_type = argument.vtype.dtype.name
+                value = self._expr_blocks(argument)
+                if dtype.name == "logical" and source_type != "logical":
+                    return ["(", *value, "/=0)"]
+                if source_type == "logical" and dtype.name != "logical":
+                    value = ["merge(1,0,", *value, ")"]
                 intrinsic = {
                     "integer": "int",
                     "real": "real",
@@ -443,7 +490,7 @@ class FortranEmitter:
                 if intrinsic is None:
                     raise NotImplementedError(f"Cannot cast to Fortran type {dtype.name!r}")
                 kind = dtype.kind
-                blocks = [intrinsic, "(", *self._expr_blocks(expr.args[0])]
+                blocks = [intrinsic, "(", *value]
                 if kind is not None:
                     blocks.extend([",kind=", str(kind)])
                 blocks.append(")")

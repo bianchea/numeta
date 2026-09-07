@@ -16,11 +16,9 @@ class BinaryOperationNode(ExpressionNode):
     @property
     def dtype(self):
         """Return the DataType of the expression."""
-        from numeta.type_rules import binary_result_dtype
+        from numeta.type_rules import resolve_binary
 
-        left_dtype = getattr(self.left, "dtype", None)
-        right_dtype = getattr(self.right, "dtype", None)
-        return binary_result_dtype(left_dtype, right_dtype, self.op)
+        return resolve_binary(self.left, self.right, self.op)[1]
 
     @property
     def _shape(self):

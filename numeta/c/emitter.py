@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .complex_compat import COMPLEX_COMPAT_HEADER
+
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, NoReturn, cast
@@ -346,6 +348,7 @@ class CEmitter:
             "\n",
             "#include <Python.h>\n",
             "#include <numpy/arrayobject.h>\n",
+            COMPLEX_COMPAT_HEADER,
         ]
         simd_header = simd_needs_header(self._vector_types, self._simd_target)
         if simd_header is not None:
@@ -407,7 +410,7 @@ class CEmitter:
         lines.append("#include <Python.h>\n")
         lines.append("#include <numpy/arrayobject.h>\n")
         lines.append("#include <numpy/npy_math.h>\n")
-        lines.append("#include <complex.h>\n")
+        lines.append(COMPLEX_COMPAT_HEADER)
         lines.append("#include <stdio.h>\n")
         lines.append("#include <stdlib.h>\n")
         lines.append("#include <omp.h>\n")
@@ -746,7 +749,7 @@ class CEmitter:
         lines.append("#include <Python.h>\n")
         lines.append("#include <numpy/arrayobject.h>\n")
         lines.append("#include <numpy/npy_math.h>\n")
-        lines.append("#include <complex.h>\n")
+        lines.append(COMPLEX_COMPAT_HEADER)
         lines.append("#include <stdlib.h>\n")
         lines.append("#include <omp.h>\n")
         lines.append("\n")

@@ -264,6 +264,19 @@ class LoweringContext:
         self.var_cache[key] = ir_var
         return ir_var
 
+    def cast_operand(self, value, dtype):
+        from numeta.type_rules import validate_literal
+
+        validate_literal(value, dtype)
+        vtype = self._get_vtype(value, dtype=dtype)
+        if isinstance(value, LiteralNode) and type(value.value) in (int, float, complex, bool):
+            # Materialize weak literals directly in the selected computation type.
+            return IRLiteral(value=value.value, vtype=vtype, source=value)
+        lowered = self.lower_expr(value)
+        if value.dtype is dtype:
+            return lowered
+        return IRIntrinsic(name="astype", args=[lowered], vtype=vtype, source=value)
+
     def lower_expr(self, expr) -> IRExpr:
         if isinstance(expr, IRExpr):
             return expr
@@ -278,6 +291,9 @@ class LoweringContext:
                 metadata={"procedure_reference": True},
             )
         if expr_type is LiteralNode:
+            from numeta.type_rules import validate_literal
+
+            validate_literal(expr, expr.dtype)
             return IRLiteral(
                 value=expr.value,
                 vtype=self._get_vtype(expr),
@@ -293,11 +309,14 @@ class LoweringContext:
         if expr_type is WholeStorage:
             return self.lower_expr(expr.variable)
         if expr_type is BinaryOperationNode or isinstance(expr, BinaryOperationNode):
+            from numeta.type_rules import resolve_binary
+
+            inputs, _ = resolve_binary(expr.left, expr.right, expr.op)
             op = _map_binary_op(expr.op)
             return IRBinary(
                 op=op,
-                left=self.lower_expr(expr.left),
-                right=self.lower_expr(expr.right),
+                left=self.cast_operand(expr.left, inputs[0]),
+                right=self.cast_operand(expr.right, inputs[1]),
                 vtype=self._get_vtype(expr),
                 source=expr,
             )
@@ -342,7 +361,19 @@ class LoweringContext:
             )
         if expr_type is IntrinsicFunction or isinstance(expr, IntrinsicFunction):
             token = getattr(expr, "token", "")
-            args = [self.lower_expr(arg) for arg in expr.arguments]
+            if token == "astype" and isinstance(expr.arguments[0], LiteralNode):
+                return self.cast_operand(expr.arguments[0], expr.dtype)
+            if token == "select":
+                dtype = expr.dtype
+                args = [self.lower_expr(expr.arguments[0])] + [
+                    self.cast_operand(arg, dtype) for arg in expr.arguments[1:]
+                ]
+            else:
+                args = [self.lower_expr(arg) for arg in expr.arguments]
+            if token == "astype":
+                from numeta.type_rules import validate_literal
+
+                validate_literal(expr.arguments[0], expr.dtype)
             if (
                 token == "round_even"
                 and getattr(expr.arguments[0].dtype, "_name", "").startswith("int")
@@ -394,9 +425,19 @@ class LoweringContext:
 
     def lower_stmt(self, stmt) -> IRNode:
         if isinstance(stmt, Assignment):
+            from numeta.type_rules import validate_literal
+
+            validate_literal(stmt.value, stmt.target.dtype)
+            from numeta.datatype import bool8
+
+            value = (
+                self.cast_operand(stmt.value, stmt.target.dtype)
+                if bool8 in (stmt.target.dtype, stmt.value.dtype)
+                else self.lower_expr(stmt.value)
+            )
             return IRAssign(
                 target=self.lower_expr(stmt.target),
-                value=self.lower_expr(stmt.value),
+                value=value,
                 source=stmt,
             )
         if isinstance(stmt, Call):

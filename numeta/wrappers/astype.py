@@ -7,7 +7,15 @@ from .simd import VCvtF32ToF64, VCvtF64ToF32, VCvtF64ToI32, VCvtI32ToF64
 
 
 def astype(value, dtype):
-    """Numerically convert a scalar or SIMD value to ``dtype``."""
+    """Lazily convert a value to ``dtype``, preserving its scalar or array shape.
+
+    This allocates no storage. Use ``scalar(value, dtype=dtype)`` to evaluate a
+    scalar once here; ``nm.f8(value)`` also creates storage. SIMD supports only
+    the conversion pairs listed below.
+    """
+    from numeta.ast.tools import check_node
+
+    value = check_node(value)
     dtype = get_datatype(dtype)
     source_dtype = value.dtype
     if is_vector_dtype(source_dtype):

@@ -181,9 +181,12 @@ class PyCExtension:
         return getattr(compiled_sub, func_name)
 
     def construct_module(self):
+        from numeta.c.complex_compat import COMPLEX_COMPAT_HEADER
+
         template = """
 #include <Python.h>
 #include <numpy/arrayobject.h>
+${complex_compat}
 
 ${numpy_wrappers} 
 
@@ -213,7 +216,7 @@ PyMODINIT_FUNC PyInit_${name}(void) {
 }
 """
 
-        substitutions = {}
+        substitutions = {"complex_compat": COMPLEX_COMPAT_HEADER}
         substitutions["name"] = f"{self.name}"
 
         from .wrappers.numpy_mem import numpy_mem

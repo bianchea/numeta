@@ -92,6 +92,19 @@ class ExpressionNode(Node):
         )
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        import numpy as np
+        from numeta.type_rules import _UFUNCS
+
+        # NumPy scalars dispatch their ordinary Python operators through this protocol.
+        if (
+            method == "__call__"
+            and not kwargs
+            and len(inputs) == 2
+            and any(isinstance(value, np.generic) for value in inputs)
+        ):
+            op = next((op for op, name in _UFUNCS.items() if getattr(np, name) is ufunc), None)
+            if op is not None:
+                return BinaryOperationNode(inputs[0], op, inputs[1])
         self._reject_python_protocol(
             f"NumPy ufunc {ufunc.__name__!r} is not supported on symbolic values. Use the "
             "corresponding Numeta intrinsic."

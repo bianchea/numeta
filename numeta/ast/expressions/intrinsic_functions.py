@@ -352,7 +352,9 @@ class Select(IntrinsicFunction):
 
     @property
     def dtype(self):
-        return self.arguments[1].dtype
+        from numeta.type_rules import resolve_selection
+
+        return resolve_selection(*self.arguments)
 
     @property
     def _shape(self):

@@ -67,7 +67,7 @@ runtime overflow checks or broadcasting rules.
 
 Mixed expressions and integer division can now infer different return dtypes.
 Rebuild affected saved libraries from their kernel definitions to adopt these rules;
-existing saved bundles are not rewritten. The package version remains 0.6.0.
+existing saved bundles are not rewritten. These numerical rules apply from version 0.7.0.
 
 ## Effects and output
 
@@ -130,4 +130,4 @@ Call the function or use `fn.specialize(...)` before accessing `fn.source` or
 the read-only `fn.sources` mapping. `fn.source` follows the most recently selected
 specialization, including cache hits. `allow_new_specializations=False` restricts
 execution to registered or loaded signatures; explicit `specialize(...)` still
-registers new ones. Numeta's package version remains 0.6.0 for this development work.
+registers new ones.

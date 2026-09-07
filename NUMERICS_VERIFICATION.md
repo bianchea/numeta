@@ -1,6 +1,7 @@
 # Predictable numerics verification
 
-Implemented `next_plan.md` without changing version 0.6.0. Existing saved libraries
+This pre-release verification was performed at version 0.6.0, before the 0.7.0
+version bump. Existing saved libraries
 are not rewritten. Rebuild affected saved libraries from their kernel definitions:
 mixed expressions can now infer wider return types, and integer `/` returns float64.
 

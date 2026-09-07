@@ -108,7 +108,7 @@ def test_scalar_loop_augassign_requires_explicit_slice(
     rebound_out = np.zeros(1, dtype=np.float64)
     materialized_out = np.zeros(1, dtype=np.float64)
 
-    with pytest.raises(nm.NumetaTypeError, match=r"Bare Variable.*runtime update") as exc_info:
+    with pytest.raises(nm.NumetaTypeError, match=r"Bare storage.*runtime update") as exc_info:
         rebound_kernel(4, rebound_out)
     assert "x = x" in str(exc_info.value)
     assert "x[:]" in str(exc_info.value)

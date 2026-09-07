@@ -135,10 +135,13 @@ class Variable(NamedEntity, ExpressionNode):
     def _reject_bare_inplace(self, operator):
         raise_with_source(
             NumetaTypeError,
-            f"Bare Variable '{operator}=' is ambiguous in traced code. "
+            f"Bare storage '{operator}=' is ambiguous in traced code. "
             f"Use 'x = x {operator} y' to build an expression, or "
             f"'x[:] {operator}= y' to perform a runtime update.",
             source_node=self,
+            use_site=True,
+            expected="an explicit storage update or lazy expression",
+            received="bare augmented assignment",
         )
 
     def __iadd__(self, other):

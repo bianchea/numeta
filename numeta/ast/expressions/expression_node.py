@@ -51,10 +51,11 @@ class ExpressionNode(Node):
             "comparisons and ternary expressions cannot trace runtime conditions. Use "
             "parenthesized comparisons with &, |, ~, nm.minimum/nm.maximum, or with nm.If/Else.",
             source_node=self,
+            use_site=True,
         )
 
     def _reject_python_protocol(self, message):
-        raise_with_source(NumetaTypeError, message, source_node=self)
+        raise_with_source(NumetaTypeError, message, source_node=self, use_site=True)
 
     def __iter__(self):
         self._reject_python_protocol(

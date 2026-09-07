@@ -32,32 +32,7 @@ class Node(ABC):
             self._source_location = None
 
     def _capture_source_location(self):
-        """Capture the source location (filename, line) where this node was created."""
-        try:
-            frame = sys._getframe(1)
-            while frame:
-                filename = frame.f_code.co_filename
-                is_numeta_internal = (
-                    _INTERNAL_AST in filename
-                    or _INTERNAL_WRAPPERS in filename
-                    or _INTERNAL_BUILDER in filename
-                    or _INTERNAL_FUNCTION in filename
-                    or _INTERNAL_IR in filename
-                    or _INTERNAL_C in filename
-                    or _INTERNAL_FORTRAN in filename
-                    or "numeta/datatype.py" in filename
-                    or "numeta/trace_validation.py" in filename
-                )
-                if not is_numeta_internal:
-                    return {
-                        "filename": filename,
-                        "lineno": frame.f_lineno,
-                        "function": frame.f_code.co_name,
-                    }
-                frame = frame.f_back
-        except Exception:
-            pass
-        return None
+        return capture_source_location()
 
     @property
     def source_location(self):
@@ -67,3 +42,36 @@ class Node(ABC):
     @abstractmethod
     def extract_entities(self):
         """Extract the nested entities of the node."""
+
+
+def capture_source_location():
+    """Capture the source location (filename, line) where this node was created."""
+    if not _TRACK_SOURCE_LOCATION:
+        return None
+    try:
+        frame = sys._getframe(1)
+        while frame:
+            filename = frame.f_code.co_filename
+            is_numeta_internal = (
+                _INTERNAL_AST in filename
+                or _INTERNAL_WRAPPERS in filename
+                or _INTERNAL_BUILDER in filename
+                or _INTERNAL_FUNCTION in filename
+                or _INTERNAL_IR in filename
+                or _INTERNAL_C in filename
+                or _INTERNAL_FORTRAN in filename
+                or "numeta/datatype.py" in filename
+                or "numeta/trace_validation.py" in filename
+                or "numeta/exceptions.py" in filename
+                or "numeta/type_rules.py" in filename
+            )
+            if not is_numeta_internal:
+                return {
+                    "filename": filename,
+                    "lineno": frame.f_lineno,
+                    "function": frame.f_code.co_name,
+                }
+            frame = frame.f_back
+    except Exception:
+        pass
+    return None

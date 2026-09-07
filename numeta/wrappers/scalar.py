@@ -6,7 +6,7 @@ from numeta.datatype import get_datatype
 from numeta.ast.tools import check_node
 from numeta.array_shape import ArrayShape
 from numeta.ast.variable import Variable
-from numeta.exceptions import NumetaTypeError, raise_with_source
+from numeta.exceptions import NumetaTypeError, raise_with_source, describe_value
 
 _MISSING = object()
 
@@ -35,7 +35,10 @@ def scalar(
     """Create scalar storage, optionally initialized at the current trace location.
 
     Both the value-first API (``scalar(value, dtype=...)``) and the historical
-    dtype-first API (``scalar(dtype, value)``) are supported.
+    dtype-first API (``scalar(dtype, value)``) are supported. ``nm.f8(expr)``
+    also creates storage. Use ``nm.astype(expr, nm.f8)`` for lazy conversion;
+    overwrite existing storage with ``snapshot[:] = other``. Initializers must
+    be scalar-shaped (rank zero).
     """
     if value is not _MISSING and value_or_dtype is _MISSING and dtype is not None:
         initializer = _MISSING if value is None else value
@@ -66,6 +69,9 @@ def scalar(
                 "nm.scalar(...) requires a scalar-shaped initializer. For an array, use "
                 "nm.empty(shape, dtype=...) followed by a sliced assignment.",
                 source_node=initializer_node,
+                expected="a scalar initializer (rank 0)",
+                received=describe_value(initializer_node),
+                use_site=True,
             )
         if dtype is None:
             dtype = initializer_node.dtype

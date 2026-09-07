@@ -22,6 +22,7 @@ from .exceptions import (
     NumetaTypeError,
     NumetaPerformanceWarning,
     format_source_location,
+    describe_value,
     raise_with_source,
 )
 
@@ -118,6 +119,8 @@ def validate_trace(builder):
                         "Use nm.scalar(expr) when creating the expression to snapshot its value.\n"
                         f"Intervening write:\n{write_location}",
                         node,
+                        expected="an expression whose inputs have not been overwritten",
+                        received=describe_value(node),
                     )
 
     def visit(statements, writes, loop_depth=0):
@@ -135,6 +138,8 @@ def validate_trace(builder):
                         NumetaTypeError,
                         "Assignment requires storage. Use nm.scalar or nm.empty.",
                         statement,
+                        expected="assignable scalar or array storage",
+                        received=describe_value(statement.target),
                     )
                 consume(statement.target, statement, writes, target=True)
                 # A storage target is not a read, but its index expressions are.
@@ -150,6 +155,8 @@ def validate_trace(builder):
                         NumetaTypeError,
                         "Cannot store an array in a scalar; use nm.empty and a sliced assignment.",
                         statement,
+                        expected=describe_value(statement.target),
+                        received=describe_value(statement.value),
                     )
                 if base._shape.is_scalar:
                     writes[id(base)] = statement
@@ -181,6 +188,8 @@ def validate_trace(builder):
                 "Materialize it once with nm.scalar(...), for example nm.scalar(nm.time()). "
                 "Declare an external function pure=True only when it has no observable effects.",
                 call,
+                expected="exactly one use of an effectful expression",
+                received=f"{use_count} uses of {describe_value(call)}",
             )
     from .settings import settings
 

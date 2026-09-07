@@ -95,20 +95,25 @@ def format_source_location(node):
     filename = loc.get("filename", "<unknown>")
     lineno = loc.get("lineno", 0)
 
-    # Try to get the actual line of code
-    try:
-        with open(filename, "r") as f:
-            lines = f.readlines()
-            if 0 <= lineno - 1 < len(lines):
-                source_line = lines[lineno - 1].rstrip()
-                return f'  File "{filename}", line {lineno}\n    {source_line}'
-    except Exception:
-        pass
+    import linecache
+
+    source_line = linecache.getline(filename, lineno).rstrip()
+    if source_line:
+        return f'  File "{filename}", line {lineno}\n    {source_line}'
 
     return f'  File "{filename}", line {lineno}'
 
 
-def raise_with_source(exception_class, message, source_node=None):
+def raise_with_source(
+    exception_class,
+    message,
+    source_node=None,
+    *,
+    expected=None,
+    received=None,
+    repair=None,
+    use_site=False,
+):
     """Raise an exception with source location information.
 
     Args:
@@ -116,6 +121,17 @@ def raise_with_source(exception_class, message, source_node=None):
         message: The error message
         source_node: The AST/IR node that caused the error (should have source_location)
     """
+    if expected is not None:
+        message += f"\nExpected: {expected}."
+    if received is not None:
+        message += f"\nReceived: {received}."
+    if repair is not None:
+        message += f"\nRepair: {repair}"
+    if use_site:
+        from types import SimpleNamespace
+        from numeta.ast.nodes.base_node import capture_source_location
+
+        source_node = SimpleNamespace(source_location=capture_source_location())
     loc_info = format_source_location(source_node)
     if loc_info:
         full_message = f"{message}\n\n{loc_info}"
@@ -123,3 +139,15 @@ def raise_with_source(exception_class, message, source_node=None):
         full_message = message
 
     raise exception_class(full_message)
+
+
+def describe_value(value):
+    """Describe symbolic values without invoking guarded Python protocols."""
+    dtype = getattr(value, "dtype", None)
+    shape = getattr(value, "_shape", None)
+    name = getattr(dtype, "_name", "untyped")
+    if shape is None:
+        return name + " value"
+    if shape.is_scalar:
+        return name + " scalar (rank 0)"
+    return name + f" array (rank {shape.rank if not shape.is_unknown else 'unknown'})"

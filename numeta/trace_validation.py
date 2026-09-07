@@ -88,9 +88,9 @@ def validate_trace(builder):
     uses = Counter()
     count = 0
 
-    def consume(expression, statement, writes, target=False):
+    def consume(expression, statement, writes, target=False, count_effects=True):
         for node in walk_expression(expression):
-            if isinstance(node, FunctionCall):
+            if count_effects and isinstance(node, FunctionCall):
                 uses[id(node)] += 1
             if not isinstance(node, ExpressionNode):
                 continue
@@ -138,9 +138,10 @@ def validate_trace(builder):
                     )
                 consume(statement.target, statement, writes, target=True)
                 # A storage target is not a read, but its index expressions are.
+                # Their effects were already counted by the target walk above.
                 for node in walk_expression(statement.target):
                     if isinstance(node, GetItem):
-                        consume(node.sliced, statement, writes)
+                        consume(node.sliced, statement, writes, count_effects=False)
                 consume(statement.value, statement, writes)
                 target_shape = statement.target._shape
                 value_shape = statement.value._shape

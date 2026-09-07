@@ -1,3 +1,6 @@
+import ctypes.util
+import os
+
 import numpy as np
 import pytest
 
@@ -143,6 +146,22 @@ def test_stale_array_read_in_store_index_is_rejected(backend):
 
     with pytest.raises(nm.NumetaError, match="snapshot"):
         kernel.specialize(np.array([0], dtype=np.int64), np.zeros(2))
+
+
+def test_effectful_store_index_is_counted_once(backend):
+    if ctypes.util.find_library("c") is None:
+        pytest.skip("libc library not found")
+    libc = nm.ExternalLibraryWrapper("c")
+    libc.add_method("getpagesize", [], nm.int32)
+    pagesize = os.sysconf("SC_PAGE_SIZE")
+
+    @nm.jit(backend=backend)
+    def kernel(out):
+        out[libc.getpagesize() - pagesize] = 4
+
+    out = np.zeros(1)
+    kernel(out)
+    assert out[0] == 4
 
 
 def test_writing_a_different_array_does_not_invalidate_read(backend):

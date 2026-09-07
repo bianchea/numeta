@@ -124,7 +124,6 @@ You can set global defaults once instead of passing them to every `@nm.jit` call
 import numeta as nm
 
 nm.settings.set_default_backend("c")
-nm.settings.set_default_do_checks(False)
 nm.settings.set_default_compile_flags("-O2 -march=native")
 ```
 
@@ -132,6 +131,61 @@ Passing `None` to `@nm.jit` parameters will also use these defaults.
 With checks enabled, wrappers validate array dtype and layout plus inferred equal-
 shape contracts for whole-array elementwise assignments such as `target[:] = source`.
 Disabling checks removes those runtime guards.
+
+### Conversion and snapshots
+
+Use `nm.astype(expr, dtype)` for lazy conversion, `nm.scalar(expr, dtype=...)`
+to evaluate and store a scalar here, and `snapshot[:] = other` to overwrite it:
+
+```python
+import numeta as nm
+import numpy as np
+
+@nm.jit
+def conversions(values, out):
+    converted = nm.astype(values, nm.f8)  # same shape, lazy; no array allocation
+    snapshot = nm.scalar(converted[0], dtype=nm.f8)  # one scalar element
+    shorthand = nm.f8(values[0])  # also creates scalar storage
+    out[0] = snapshot
+    snapshot[:] = 7.0
+    snapshot[:] += 1.0  # explicit runtime update
+    expression = snapshot + 1.0  # lazy replacement for bare snapshot += 1
+    out[1] = expression
+    out[2] = shorthand
+    out[3:] = converted
+
+out = np.empty(5)
+conversions(np.array([2.0, 3.0], dtype=np.float32), out)
+np.testing.assert_array_equal(out, [2.0, 9.0, 2.0, 2.0, 3.0])
+```
+
+`nm.scalar(values, dtype=nm.f8)` cannot initialize a scalar from an array; select
+an element as above, or allocate with `nm.empty(values.shape, dtype=nm.f8)` and
+assign through `[:]`. `nm.scalar(nm.f8, expr)` and `nm.f8(expr)` remain supported
+storage constructors. SIMD conversion remains limited to the documented dtype
+pairs; shape-preserving array conversion does not extend SIMD support.
+
+Arithmetic `+`, `-`, `*`, `/`, comparisons, and `nm.where` value branches use
+NumPy-style promotion. Python literals are weak beside typed values: adding
+`1.0` to float32 keeps float32, while adding `np.float64(1.0)` promotes to float64.
+Runtime arguments, including Python scalars passed to kernels, are strongly typed.
+Integer `/` returns float64; use `nm.trunc_div` for native truncating division.
+The destination dtype still controls storage conversion after computation.
+
+### Unchecked performance
+
+For measured workloads whose callers satisfy the argument contracts, wrapper
+validation can be disabled explicitly:
+
+```python
+import numeta as nm
+
+nm.settings.set_default_do_checks(False)
+```
+
+This removes wrapper dtype, layout, and supported shape checks. It does not
+change kernel bounds checking: optimized kernel indexing is already unchecked.
+The runtime defaults are unchanged.
 
 ### Backends
 

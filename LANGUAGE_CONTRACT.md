@@ -35,6 +35,40 @@ The diagnostic identifies both locations and suggests `nm.scalar(expr)`.
 This bounded check does not prove overlap for runtime indices, partial slices,
 different array arguments sharing memory, or general control-flow paths.
 
+## Conversion and computation dtypes
+
+```python
+converted = nm.astype(expr, nm.f8)       # lazy conversion
+snapshot = nm.scalar(expr, dtype=nm.f8)  # evaluate and store here
+snapshot[:] = other                     # runtime overwrite
+```
+
+`nm.f8(expr)` also creates scalar storage, as does `nm.scalar(nm.f8, expr)`.
+These supported shorthand forms do not mean lazy conversion. Scalar initializers
+must have rank zero; choose an array element or allocate an array and store through
+`[:]`. `nm.astype` preserves array shape without allocating or taking a snapshot.
+It does not introduce additional SIMD conversion pairs.
+
+Arithmetic `+`, `-`, `*`, `/`, numeric comparisons, and `nm.where` value branches
+use NumPy-style promotion independent of operand order. NumPy scalars, storage,
+arrays, and runtime kernel arguments are strongly typed. Ordinary Python literals
+beside typed operands are weak: float32 plus `1.0` stays float32, but an explicit
+float64 operand promotes it. Standalone literals and expressions containing only
+untyped literals retain configured defaults. Integer `/` computes in float64;
+`nm.trunc_div` retains native truncation. Storage dtypes remain authoritative:
+computation is promoted before assignment conversion, including explicit narrowing.
+
+`nm.where` requires a Boolean condition; compare numeric conditions explicitly,
+for example `condition != 0`. Complex arithmetic, equality, and selection are
+supported; ordered complex comparisons require explicit real parts or magnitudes.
+Compile-time literals outside the selected dtype's range are rejected; use a wider
+typed operand. Ordinary floating-point rounding is permitted. There are no new
+runtime overflow checks or broadcasting rules.
+
+Mixed expressions and integer division can now infer different return dtypes.
+Rebuild affected saved libraries from their kernel definitions to adopt these rules;
+existing saved bundles are not rewritten. The package version remains 0.6.0.
+
 ## Effects and output
 
 Built-in math is pure. `nm.time()` and external functions are effectful by default.

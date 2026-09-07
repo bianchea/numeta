@@ -37,6 +37,19 @@ test-fortran:
   script:
     - pytest -v --backend=fortran
 
+test-numpy126:
+  extends: .native-test
+  variables:
+    PYTHON_VERSION: "3.12"
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends build-essential gfortran liblapack-dev libblas-dev
+    - python -m pip install "numpy==1.26.4" setuptools wheel
+    - python -m pip install --no-build-isolation ".[dev]"
+  script:
+    - python -c "import numpy; assert numpy.__version__ == '1.26.4'"
+    - pytest -v tests/test_numeric_promotion.py tests/test_typed_lowering.py tests/test_readme_contract_examples.py
+
 package:
   stage: package
   image: python:3.12

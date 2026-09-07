@@ -15,7 +15,13 @@ def example(section):
 
 
 @pytest.mark.parametrize(
-    "section", ["## Quick Start\n", "### Conditional Statements\n", "### Parallel Loop Example\n"]
+    "section",
+    [
+        "## Quick Start\n",
+        "### Conditional Statements\n",
+        "### Parallel Loop Example\n",
+        "### Conversion and snapshots\n",
+    ],
 )
 def test_readme_control_examples(section, backend):
     previous = nm.settings.default_backend
